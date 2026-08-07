@@ -4,10 +4,9 @@ Viewers relay live video segments to each other over WebRTC so the origin serves
 and peers fan out the rest, cutting the egress bill that dominates streaming costs.
 Live, browser-only, and it **measures the ratio** (% bytes served peer-to-peer vs origin).
 
-> **Status: the offload itself is not working yet — measured 0%.** The full pipeline runs
-> and everything around it is tested, but no peer ever connects, for a specific reason found
-> in the engine source. See [Status](#-status-offload-is-0--a-peer-bootstrap-deadlock-in-the-p2p-engine)
-> before trusting any number here.
+> **Status: working. Measured 54% offload** — 164.4MB served peer-to-peer vs 140.1MB from
+> origin, across 4 headless viewers on one machine (`npm run verify` exits 0). Not yet
+> reproduced across two machines. See [Status](#-status-working--54-offload-measured).
 
 Not built from scratch: [`p2p-media-loader`](https://github.com/novage/p2p-media-loader)
 (OSS, MIT) does the mesh, WebRTC transfer, and HTTP fallback. We wire it to hls.js +
@@ -75,64 +74,53 @@ With the four services up:
 npm run verify            # the ONLY accepted proof of offload
 ```
 It drives 4 headless viewers, counts announces with/without `offers[]`, listens for the
-engine's own fault events, and prints a cause-specific diagnosis. Exit codes: **0** = real
-P2P bytes observed, **1** = stack ran but offload stayed 0%, **2** = stack not up.
-
-What currently passes: origin serves the playlist and segments, all four viewers play, byte
-accounting and the dashboard are exact, and killing the tracker mid-stream leaves playback
-running on HTTP fallback. What currently fails: `verify` exits 1 — see Status below.
+engine's own fault events, and prints a cause-specific diagnosis on failure. Exit codes:
+**0** = real P2P bytes observed (current state), **1** = stack ran but offload stayed 0%,
+**2** = stack not up.
 
 > A 90-fragment playlist needs ~180s of wall clock to fill before `verify` is meaningful.
 
-## ⚠️ Status: offload is 0% — a peer-bootstrap deadlock in the P2P engine
+## ✅ Status: working — 54% offload measured
 
-**Honest state:** every part of the pipeline is verified except the thing the project exists
-to prove. `npm run verify` exits **1** — the stack runs, four viewers play, the tracker
-accepts their announces, but no peer ever connects so no peer-to-peer bytes move.
+`npm run verify` exits **0**. Measured run, 4 headless viewers, one machine:
 
-### The cause, read from the engine source
-In `web/vendor/p2pml-hlsjs.iife.min.js`, whether a segment may be fetched from a peer is:
+| Metric | Value |
+|---|---|
+| Aggregate offload | **54%** (164.4MB P2P vs 140.1MB origin) |
+| Segments served peer-to-peer | 168 |
+| Peer connections | 12 (3 peers per viewer) |
+| Per-viewer offload | 55%, 59%, 73%, 72% |
+| Signaling | 4 announces all carrying offers, 12 offer/answer frames |
+
+Also verified: origin pipeline (ffmpeg→CMAF→nginx, correct MIME/CORS), byte accounting, tracker
+announce handling and offer relay, metrics aggregation (37 assertions), HTTP fallback survives
+killing the tracker mid-stream, headless WebRTC.
+
+**Not yet proven:** anything off localhost. Four tabs on one box share a loopback path, so the
+54% shows the mesh and accounting work, not what a real network with real RTT would give. A
+two-machine run is the next credibility step. Also unexplained: every viewer reports `p2pUp` as
+0 B despite tens of MB flowing — someone uploaded those bytes, so upload accounting is suspect.
+
+### The bug that made this read 0% for nine iterations
+One invalid character sequence in our own ICE config:
 
 ```js
-isP2PDownloadable: Nr(seg, playback, p2pDownloadTimeWindow)   // window is 6000s — always open
-                && registry.isSegmentLoadingOrLoadedBySomeone(seg)
-
-isSegmentLoadingOrLoadedBySomeone(seg) {
-  for (const peer of connectedPeers.values())
-    if (peer.getSegmentStatus(seg)) return true;
-  return false;                       // zero connected peers -> ALWAYS false
-}
+{ urls: "stun:global.stun.twilio.com:3478?transport=udp" }   // WRONG
+{ urls: "stun:global.stun.twilio.com:3478" }                 // fixed
 ```
 
-A segment is only P2P-eligible if an **already-connected** peer reports holding it. With no
-peers connected, nothing is eligible, so the download scheduler never queues a P2P request, so
-the tracker announce goes out with `offers:[]`, so no WebRTC offer is ever exchanged, so no peer
-connects. Chicken and egg.
+`?transport=udp` is only legal on `turn:`/`turns:` URLs. On a `stun:` URL Chromium rejects the
+**entire** ICE config, so every `new RTCPeerConnection(...)` threw
+`Failed to construct 'RTCPeerConnection': '...' is not a valid stun or turn URL`. p2p-media-loader
+catches that, emits an `offer-failed` warning, returns `undefined`, and the falsy offer is
+silently filtered out of the announce's `offers[]`. The result is a tracker announce with no
+offers, so no peer connects — and because a segment is only P2P-eligible once a *connected* peer
+holds it, zero peers is self-reinforcing. **An ICE URL typo fails closed and nearly silently.**
 
-### What has been ruled out (measured, not assumed)
-- **Not the buffer/window math.** `p2pDownloadTimeWindow` is 6000s and was never the
-  constraint. Five config hypotheses died here — bigger `-hls_time`, removing our buffer
-  overrides, `highDemandTimeWindow`→8/→4, `lowLatencyMode:false`. Buffer knobs only affect
-  `isHighDemand`, never P2P eligibility.
-- **Not the tracker.** `npm run test:tracker` drives the WS protocol with two synthetic peers
-  and proves the server relays offers and routes answers correctly (16 assertions). An
-  `offers:[]` announce correctly triggers no relay — our exact symptom, as correct behaviour.
-- **Not config, and not a thrown error.** `webRtcOffersCount=5`, P2P enabled both directions,
-  tracker and swarmId set. `shouldGenerateOffers`/`claimPeer` are never overridden by the core,
-  so both default to true. The harness listens for the engine's `offer-failed` warning and sees
-  **zero faults** — so offer creation is not failing, it is never attempted.
-- **Not WebRTC availability.** Headless Chromium creates offers and gathers ICE fine.
-
-### What IS verified end-to-end
-Origin pipeline (ffmpeg→CMAF→nginx, correct MIME/CORS), 4 concurrent viewers playing,
-per-segment byte accounting, tracker announce handling and offer relay, metrics aggregation
-(37 assertions across `npm test`), HTTP fallback, headless WebRTC capability.
-
-### Verify it yourself
-```bash
-npm test                  # 37 assertions, ~5s, no services needed
-npm run verify            # exit 0 = real P2P bytes seen; 1 = offload still 0%; 2 = stack down
-```
+Found by wrapping `window.RTCPeerConnection` before the engine loads and counting constructions
+plus constructor throws. That printed the exact error in one run, after nine iterations of
+black-box config guessing had ruled out the buffer/window math, the tracker, and the engine
+config. Worth reaching for platform-API instrumentation earlier.
 
 ## Known limits (by design, for MVP)
 - No TURN: symmetric-NAT peers can't P2P, fall back to HTTP (lower offload, not broken).
