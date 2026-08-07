@@ -61,24 +61,23 @@
       const HlsWithP2P = HlsJsP2PEngine.injectMixin(window.Hls);
 
       const hls = new HlsWithP2P({
-        // Sit WELL BACK from the live edge and buffer deep. p2p-media-loader always
-        // pulls the nearest segments (highDemandTimeWindow) over HTTP; only segments
-        // further back are eligible for P2P. Playing back from the edge with a deep
-        // buffer puts most wanted segments into that P2P zone -> mesh forms, offload
-        // climbs. Trades a few extra seconds of latency for offload (expected).
-        liveSyncDurationCount: 10,
-        backBufferLength: 60,
-        maxBufferLength: 120,        // deep forward buffer: puts many segments into the
-        maxMaxBufferLength: 180,     // P2P-eligible zone (beyond the ~5-seg high-demand edge)
+        // DO NOT set liveSyncDuration(Count), maxBufferLength or maxMaxBufferLength here.
+        // p2p-media-loader sizes those itself to open the P2P window, but ONLY when the
+        // app hasn't — from the engine source:
+        //   details.live && !userConfig.liveSyncDuration && !userConfig.liveSyncDurationCount
+        //     && updateLiveSyncDurationCount(...)
+        //   !userConfig.maxBufferLength && !userConfig.maxMaxBufferLength
+        //     && updateMaxBufferLength(details.targetduration)
+        // Setting any of them suppresses that auto-tune, the viewer stays ~3 segments from
+        // the live edge, the core zeroes the P2P window (jr(): t<=5 -> both windows 0), and
+        // no mesh ever forms. Leaving them unset is what makes P2P engage.
         p2p: {
           core: {
             swarmId: cfg.swarmId,
             announceTrackers: cfg.announceTrackers,
             rtcConfig: { iceServers: cfg.iceServers },
-            // Shrink the always-HTTP zone to the nearest 6s; everything older is P2P.
-            highDemandTimeWindow: 6,
-            httpDownloadTimeWindow: 6,
-            p2pDownloadTimeWindow: 60,
+            // Download-window defaults are left alone on purpose. They interact with the
+            // buffer auto-tune above; hand-tuning them was part of what kept P2P off.
           },
           onHlsJsCreated(hls) {
             const eng = hls.p2pEngine;

@@ -9,7 +9,8 @@
     "web": "http-server web -p 5173 -c-1 --cors",
     "origin:loop": "bash origin/segment.sh loop origin/sample.mp4",
     "origin:rtmp": "bash origin/segment.sh rtmp",
-    "nginx": "bash origin/run-nginx.sh"
+    "nginx": "bash origin/run-nginx.sh",
+    "verify": "node test/verify-offload.js"
   },
   "dependencies": {
     "bittorrent-tracker": "^11.2.1",

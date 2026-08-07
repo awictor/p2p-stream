@@ -63,32 +63,42 @@ Open the dashboard: <http://localhost:8001>. Open viewers: <http://localhost:517
    keep playing via HTTP origin. Playback never fully breaks.
 5. **Latency.** Confirm live delay stays a few seconds.
 
-## ⚠️ localhost does NOT show P2P offload (verified)
+## ⚠️ Status: offload is currently 0% — known cause, unsolved
 
-Running all viewers + origin on one machine shows **0% offload** — this is expected, not
-a bug. p2p-media-loader generates a WebRTC offer only when a segment *request needs P2P*.
-Its download scheduler (minified `jr()` in the core) zeroes the P2P window when a viewer
-holds ≤5 segments ahead:
+**Honest state:** every part of the pipeline is verified except the thing the project exists
+to prove. `npm run verify` currently exits **1** — the stack runs, four viewers play, the
+tracker pairs them, but no peer-to-peer bytes move.
 
+Two gates inside the p2p-media-loader core fight each other:
+
+1. `jr()` zeroes **both** download windows when a viewer holds ≤5 segments ahead:
+   ```
+   t<=5 ? (httpDownloadTimeWindow=0, p2pDownloadTimeWindow=0)
+        : t<=10 && (p2pDownloadTimeWindow = httpDownloadTimeWindow)
+   ```
+2. Anything inside `highDemandTimeWindow` is HTTP-only regardless of gate 1.
+
+Measured (see `.p2p-loop/patterns.md`): leaving hls.js buffer keys unset lets the engine's
+auto-tune run (`liveSyncDurationCount→29`, `maxBufferLength→15`), giving a 15.4s / 7.7-segment
+buffer that clears gate 1 — but the same auto-tune sets `highDemandTimeWindow=15` ≥ that
+buffer, so every buffered segment stays HTTP-only. Forcing `highDemandTimeWindow=4` collapses
+the buffer to 3.8s / 1.9 segments, falling back under gate 1. Note that setting the buffer
+keys yourself *suppresses* the auto-tune entirely (the engine guards on `!userConfig.<key>`),
+so `web/index.html` deliberately leaves them alone.
+
+Untried, in priority order: larger `-hls_time` (more seconds per segment may clear both gates
+at once); VOD with a genuinely deep buffer; a real second network so HTTP stops being
+instant-localhost.
+
+**What IS verified end-to-end:** origin pipeline (ffmpeg→CMAF→nginx, correct MIME/CORS), 4
+concurrent viewers playing, per-segment byte accounting, tracker peer pairing (`incomplete:N`),
+metrics aggregation + dashboard (exact on synthetic input), HTTP fallback, and headless WebRTC
+capability (offer + ICE). The plumbing is sound; the window math is the blocker.
+
+### Verify it yourself
+```bash
+npm run verify            # exit 0 = real P2P bytes seen; 1 = offload still 0%; 2 = stack down
 ```
-t<=5 ? (httpDownloadTimeWindow=0, p2pDownloadTimeWindow=0)   // high-demand: HTTP only
-     : t<=10 && (p2pDownloadTimeWindow = httpDownloadTimeWindow)
-```
-
-On a same-box origin, HTTP fetches are effectively instant, so every segment is served
-before P2P can compete → no P2P request ever queues → the engine sends `offers:[]` and no
-mesh forms. Confirmed across live + VOD, deep buffers (120s), CDP throttling (6 Mbps +
-120ms), and staggered joins — none make P2P competitive against localhost.
-
-**What WAS verified end-to-end on one box:** origin pipeline (ffmpeg→CMAF→nginx, correct
-MIME/CORS), 4 concurrent viewers playing, per-segment byte accounting, tracker peer pairing
-(`incomplete:2`), metrics aggregation + dashboard (85% on synthetic input), and HTTP
-fallback. Everything except the actual peer byte transfer.
-
-**To actually demonstrate offload:** run the origin on one host and viewers on ≥2 separate
-machines/networks (real RTT + bandwidth cost), OR deploy origin behind a bandwidth-limited
-CDN tier. Real network latency to origin is what pushes segments into the P2P window. This
-is a property of the p2p-media-loader scheduler, not this integration.
 
 ## Known limits (by design, for MVP)
 - Newest live-edge segment is always origin-served first, then propagates → caps max
