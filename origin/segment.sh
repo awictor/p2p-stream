@@ -21,10 +21,18 @@ FFMPEG="${FFMPEG:-$ROOT/bin/ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe}"
 # 2s segments: big enough that peers have time to fetch+relay a segment before a
 # neighbor needs it (offload window). Shrink toward LL-HLS parts later for lower latency.
 SEG_SECONDS=2
-# Deep live window (60s). P2P only engages for segments BEYOND the high-demand zone
-# (nearest ~15s, always HTTP). A short window leaves no room for the P2P zone, so the
-# mesh never forms. 30 segments gives viewers buffer depth where peers can serve.
-LIST_SIZE=30
+# Deep live window. P2P only engages for segments BEYOND the high-demand zone (nearest
+# 15s, always HTTP), and the core also zeroes both download windows unless the viewer
+# holds >5 segments ahead. Playlist depth is what buys that runway.
+#
+# The engine sets liveSyncDurationCount = min(fragments-1, floor(60/SEG_SECONDS)), so with
+# 2s segments it caps at 30 no matter how long the playlist is. At LIST_SIZE=30 that gave
+# min(29,30)=29 -> the playhead sits 58s back in a 60s window, right on the boundary where
+# delete_segments is erasing fragments behind it; measured buffer only reached 14.4s, just
+# under the 15s high-demand window. At LIST_SIZE=90 the cap binds at 30 instead, parking the
+# playhead 60s back in a 180s window: ~120s of runway that is NOT being deleted underneath.
+# Costs disk (90 x ~1MB) and nothing else; ffmpeg still deletes beyond the window.
+LIST_SIZE=90
 
 common_hls_flags=(
   -c:v libx264 -preset veryfast -tune zerolatency -g $((SEG_SECONDS*30)) -sc_threshold 0
