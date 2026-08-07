@@ -108,6 +108,8 @@ async function preflight() {
   let announcesWithOffers = 0;
   let announcesNoOffers = 0;
   let answers = 0;
+  // Engine-reported faults (notably "offer-failed"), collected across all viewers.
+  const engineFaults = [];
 
   try {
     for (let i = 0; i < VIEWERS; i++) {
@@ -129,6 +131,13 @@ async function preflight() {
         const t = m.text();
         if (t.startsWith("P2PSEG")) { p2pSegments++; console.log(`  [tab${i}] ${t}`); }
         if (t.startsWith("P2PPEER")) { peerConnects++; console.log(`  [tab${i}] ${t}`); }
+        // The core swallows offer-creation failures into a `warning` event named
+        // "offer-failed" and then filters the undefined out of offers[], which is
+        // why an empty offers[] otherwise looks like a silent no-op.
+        if (t.startsWith("P2PWARN") || t.startsWith("P2PERROR")) {
+          engineFaults.push(t);
+          console.log(`  [tab${i}] ${t}`);
+        }
       });
       await page.goto(VIEWER_URL, { waitUntil: "domcontentloaded" });
       // Hook the engine directly so a P2P segment is impossible to miss or fake.
@@ -142,6 +151,19 @@ async function preflight() {
         });
         hls.p2pEngine.addEventListener("onPeerConnect", (d) =>
           console.log(`P2PPEER ${d && d.peerId ? d.peerId : ""}`));
+        // Surface the core's own diagnostics. "offer-failed" here names exactly why
+        // an announce went out with offers:[] instead of leaving it a mystery.
+        const fmt = (e) => {
+          if (!e) return "";
+          const parts = [e.type, e.code, e.message, e.streamType].filter(Boolean);
+          return parts.length ? parts.join(" | ") : JSON.stringify(e).slice(0, 200);
+        };
+        for (const ev of ["error", "warning", "onError", "onWarning"]) {
+          try {
+            hls.p2pEngine.addEventListener(ev, (e) =>
+              console.log(`${ev.toLowerCase().includes("err") ? "P2PERROR" : "P2PWARN"} ${ev}: ${fmt(e)}`));
+          } catch { /* engine may not expose this event name */ }
+        }
       });
       pages.push(page);
       console.log(`  viewer ${i + 1}/${VIEWERS} joined`);
@@ -187,6 +209,7 @@ async function preflight() {
     const pct = Math.round(final.offloadRatio * 100);
     console.log(`\nsegments via p2p: ${p2pSegments} | peer connects: ${peerConnects}`);
     console.log(`signaling: announces with offers=${announcesWithOffers}, with offers:[]=${announcesNoOffers}, offer/answer frames received=${answers}`);
+    console.log(`engine faults: ${engineFaults.length}${engineFaults.length ? ` (first: ${engineFaults[0]})` : ""}`);
     console.log(`aggregate offload: ${pct}% (p2p=${mb(final.p2pBytes)} http=${mb(final.httpBytes)})`);
 
     if (final.p2pBytes > 0 && p2pSegments > 0) {
@@ -195,9 +218,18 @@ async function preflight() {
     } else {
       console.log("\nFAIL(1): no P2P bytes in the watch window. Offload is unproven.");
       if (announcesWithOffers === 0) {
-        console.log("  DIAGNOSIS: every announce carried offers:[] — the engine never asked for");
-        console.log("  a peer, so this is the download scheduler / window math, NOT WebRTC.");
-        console.log("  Check buffer depth vs highDemandTimeWindow and segments-ahead > 5.");
+        console.log("  DIAGNOSIS: every announce carried offers:[] — no WebRTC offer was ever");
+        console.log("  generated, so no peer can connect, and with zero connected peers no");
+        console.log("  segment is P2P-eligible (isSegmentLoadingOrLoadedBySomeone). Deadlock.");
+        const offerFailed = engineFaults.filter((f) => f.includes("offer-failed"));
+        if (offerFailed.length) {
+          console.log(`  CAUSE: ${offerFailed.length} offer-failed warning(s) from the core:`);
+          console.log(`    ${offerFailed[0]}`);
+        } else {
+          console.log("  No offer-failed warning was emitted, so offer creation was never even");
+          console.log("  attempted — suspect shouldGenerateOffers()/offersCount() or that the");
+          console.log("  tracker client never reached the 'connected' WS state before announcing.");
+        }
       } else if (peerConnects === 0) {
         console.log(`  DIAGNOSIS: ${announcesWithOffers} announces DID carry offers but no peer`);
         console.log("  connected — this is signaling/WebRTC negotiation, not window math.");
