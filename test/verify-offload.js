@@ -257,6 +257,19 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
       p2pSegments, peerConnects, pass: dP2p > 0 && p2pSegments > 0,
     };
 
+    // Conservation check: every byte downloaded FROM a peer was uploaded BY a peer, so in a
+    // closed local swarm p2pUp should track p2pDown. This is the cheapest guard against the
+    // accounting silently breaking again — p2pUp read a flat 0 B for two iterations because
+    // the viewer listened on a nonexistent "onSegmentUploaded" event. Reported, not asserted:
+    // a viewer can leave mid-run and take its counters with it, so exact equality is wrong.
+    if (dP2p > 0) {
+      const ratio = dUp / dP2p;
+      const skew = Math.round(Math.abs(1 - ratio) * 100);
+      console.log(`upload conservation: up/down = ${ratio.toFixed(2)} (${skew}% skew)` +
+        (dUp === 0 ? "  <-- SUSPECT: nobody uploaded the bytes someone downloaded"
+                   : skew > 25 ? "  <-- check for viewers leaving mid-run" : "  ok"));
+    }
+
     if (final.p2pBytes > 0 && p2pSegments > 0) {
       console.log("\nPASS: real peer-to-peer bytes observed.");
       process.exitCode = 0;

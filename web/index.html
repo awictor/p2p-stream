@@ -114,8 +114,17 @@
               paint();
             });
             // Bytes WE served to other peers (our contribution to offloading origin).
-            eng.addEventListener("onSegmentUploaded", (d) => {
-              uploadBytes += (d.bytesLength || d.byteLength || 0);
+            // There is NO "onSegmentUploaded" event — upload is reported per CHUNK, and the
+            // handler receives POSITIONAL args, not an object:
+            //   onChunkUploaded(bytesLength, peerId, streamType, infoHash)
+            // Listening on the wrong name with an object destructure is why this read 0 B
+            // for every viewer while tens of MB were actually being served.
+            // The full engine event list is: onChunkDownloaded, onChunkUploaded,
+            // onPeerConnect, onPeerConnectError, onPeerClose, onPeerError, onPeerWarning,
+            // onTrackerWarning, onTrackerError, onSegmentError, onSegmentAbort,
+            // onSegmentStart, onSegmentLoaded.
+            eng.addEventListener("onChunkUploaded", (bytesLength) => {
+              uploadBytes += Number(bytesLength) || 0;
               paint();
             });
             eng.addEventListener("onPeerConnect", () => { peers++; paint(); });

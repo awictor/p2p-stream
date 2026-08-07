@@ -4,9 +4,9 @@ Viewers relay live video segments to each other over WebRTC so the origin serves
 and peers fan out the rest, cutting the egress bill that dominates streaming costs.
 Live, browser-only, and it **measures the ratio** (% bytes served peer-to-peer vs origin).
 
-> **Status: working. Measured 54% offload** — 164.4MB served peer-to-peer vs 140.1MB from
-> origin, across 4 headless viewers on one machine (`npm run verify` exits 0). Not yet
-> reproduced across two machines. See [Status](#-status-working--54-offload-measured).
+> **Status: working, and offload rises with swarm size — 45% at 2 viewers, 79% at 8.**
+> Measured by `npm run verify:sweep` on one machine. Not yet reproduced across two machines.
+> See [Status](#-status-working--offload-rises-with-swarm-size).
 
 Not built from scratch: [`p2p-media-loader`](https://github.com/novage/p2p-media-loader)
 (OSS, MIT) does the mesh, WebRTC transfer, and HTTP fallback. We wire it to hls.js +
@@ -71,7 +71,8 @@ npm test                  # 37 assertions: metrics aggregation (21) + tracker si
 
 With the four services up:
 ```bash
-npm run verify            # the ONLY accepted proof of offload
+npm run verify            # the ONLY accepted proof of offload (~2min)
+npm run verify:sweep      # offload vs viewer count, 1/2/4/8 (~4min)
 ```
 It drives 4 headless viewers, counts announces with/without `offers[]`, listens for the
 engine's own fault events, and prints a cause-specific diagnosis on failure. Exit codes:
@@ -80,26 +81,34 @@ engine's own fault events, and prints a cause-specific diagnosis on failure. Exi
 
 > A 90-fragment playlist needs ~180s of wall clock to fill before `verify` is meaningful.
 
-## ✅ Status: working — 54% offload measured
+## ✅ Status: working — offload rises with swarm size
 
-`npm run verify` exits **0**. Measured run, 4 headless viewers, one machine:
+`npm run verify:sweep` runs the harness once per viewer count. More viewers means more peers
+to pull from, so offload climbs — which is the whole economic argument:
 
-| Metric | Value |
-|---|---|
-| Aggregate offload | **54%** (164.4MB P2P vs 140.1MB origin) |
-| Segments served peer-to-peer | 168 |
-| Peer connections | 12 (3 peers per viewer) |
-| Per-viewer offload | 55%, 59%, 73%, 72% |
-| Signaling | 4 announces all carrying offers, 12 offer/answer frames |
+| viewers | offload | served P2P | served by origin | peer connections |
+|---|---|---|---|---|
+| 1 | **0%** | 0.0MB | 31.5MB | 0 |
+| 2 | 45% | 77.1MB | 95.4MB | 2 |
+| 4 | 67% | 236.5MB | 114.7MB | 12 |
+| 8 | **79%** | 585.8MB | 158.3MB | 50 |
 
-Also verified: origin pipeline (ffmpeg→CMAF→nginx, correct MIME/CORS), byte accounting, tracker
-announce handling and offer relay, metrics aggregation (37 assertions), HTTP fallback survives
-killing the tracker mid-stream, headless WebRTC.
+At 8 concurrent viewers the origin served 79% less. `N=1` at 0% is correct — a lone viewer has
+no peer to pull from — and peer connections growing 2→12→50 is the mesh fanning out rather than
+a star. `N=2` measured 45% and 44% on independent runs.
 
-**Not yet proven:** anything off localhost. Four tabs on one box share a loopback path, so the
-54% shows the mesh and accounting work, not what a real network with real RTT would give. A
-two-machine run is the next credibility step. Also unexplained: every viewer reports `p2pUp` as
-0 B despite tens of MB flowing — someone uploaded those bytes, so upload accounting is suspect.
+**Upload accounting cross-checks.** Every byte downloaded from a peer must have been uploaded by
+one, and it balances: 171.6MB down vs 172.6MB up in a 4-viewer run (0.6% skew). The harness now
+prints an `upload conservation` ratio each run, because this silently read 0 B until iteration 12.
+
+Also verified: origin pipeline (ffmpeg→CMAF→nginx, correct MIME/CORS), tracker announce handling
+and offer relay, metrics aggregation (37 assertions), HTTP fallback survives killing the tracker
+mid-stream, headless WebRTC.
+
+**Not yet proven: anything off localhost.** These viewers are tabs on one machine sharing a
+loopback path, so the numbers show the mesh, the scaling shape, and the accounting are real —
+not what a network with genuine RTT, packet loss, and asymmetric home uplinks would give. A
+two-machine run is the next credibility step.
 
 ### The bug that made this read 0% for nine iterations
 One invalid character sequence in our own ICE config:
