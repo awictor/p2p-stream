@@ -5,11 +5,21 @@
 //
 // Start:  node server/tracker.js         (defaults: tracker :8000, metrics :8001)
 //         PORT=8000 METRICS_PORT=8001 node server/tracker.js
+import { networkInterfaces } from "os";
 import { Server } from "bittorrent-tracker";
 import { startMetrics } from "./metrics.js";
 
 const PORT = Number(process.env.PORT || 8000);
 const METRICS_PORT = Number(process.env.METRICS_PORT || 8001);
+
+// Node binds 0.0.0.0 by default, so these services are ALREADY reachable from other
+// machines on the LAN. Print the routable address rather than "localhost", which is what
+// a second machine needs and which the old log line actively hid.
+export function lanAddress() {
+  const nets = Object.values(networkInterfaces()).flat();
+  const hit = nets.find((n) => n && n.family === "IPv4" && !n.internal);
+  return hit ? hit.address : "localhost";
+}
 
 const tracker = new Server({
   udp: false,
@@ -30,7 +40,9 @@ tracker.on("start", () => {
 });
 
 tracker.listen(PORT, () => {
+  const lan = lanAddress();
   console.log(`[tracker] WS signaling on ws://localhost:${PORT}`);
+  if (lan !== "localhost") console.log(`[tracker] reachable from LAN at ws://${lan}:${PORT}`);
 });
 
 // Metrics collector runs alongside (viewers POST their byte counters here).

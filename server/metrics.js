@@ -4,6 +4,7 @@
 // offload ratio = p2pBytes / (httpBytes + p2pBytes). Dashboard at GET /.
 import express from "express";
 import path from "path";
+import { networkInterfaces } from "os";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -60,5 +61,12 @@ export function startMetrics(port) {
     };
   }
 
-  app.listen(port, () => console.log(`[metrics] dashboard http://localhost:${port}`));
+  app.listen(port, () => {
+    console.log(`[metrics] dashboard http://localhost:${port}`);
+    // Also print the LAN address: a viewer on another machine must POST here, and
+    // "localhost" would resolve to that machine itself.
+    const nets = Object.values(networkInterfaces()).flat();
+    const lan = nets.find((n) => n && n.family === "IPv4" && !n.internal);
+    if (lan) console.log(`[metrics] reachable from LAN at http://${lan.address}:${port}`);
+  });
 }
