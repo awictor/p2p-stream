@@ -1,0 +1,18 @@
+# Heavy portable binaries (choco needs admin; downloaded at setup)
+bin/
+
+# Dependencies
+node_modules/
+
+# Generated media + runtime output
+origin/hls/
+origin/*.mp4
+origin/logs/
+origin/temp/
+
+# Loop state — LOCAL ONLY, never pushed
+.p2p-loop/
+
+# Scratch
+*.log
+/tmp/

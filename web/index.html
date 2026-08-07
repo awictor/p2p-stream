@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>P2P Live Viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- hls.js (MSE player) + p2p-media-loader IIFE build. p2p engine plugs in as a
+       custom loader: segment bytes arrive from peers over WebRTC or from origin over
+       HTTP, then get appended to MSE exactly as normal hls.js playback. -->
+  <script src="./vendor/hls.min.js"></script>
+  <script src="./vendor/p2pml-hlsjs.iife.min.js"></script>
+  <script src="./p2p-config.js"></script>
+  <style>
+    body { font:15px/1.5 system-ui,sans-serif; background:#0e1116; color:#e6edf3; margin:0; padding:1.5rem; }
+    video { width:100%; max-width:720px; background:#000; border-radius:8px; }
+    .row { display:flex; gap:1rem; flex-wrap:wrap; margin-top:1rem; max-width:720px; }
+    .stat { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:.6rem .9rem; flex:1; min-width:120px; }
+    .stat .k { font-size:.72rem; color:#8b949e; text-transform:uppercase; }
+    .stat .v { font-size:1.3rem; font-weight:600; }
+    #peers { color:#3fb950; }
+    small { color:#8b949e; }
+  </style>
+</head>
+<body>
+  <video id="video" controls autoplay muted playsinline></video>
+  <div class="row">
+    <div class="stat"><div class="k">This viewer offload</div><div class="v" id="ratio">0%</div></div>
+    <div class="stat"><div class="k">Peers connected</div><div class="v" id="peers">0</div></div>
+    <div class="stat"><div class="k">HTTP bytes</div><div class="v" id="http">0</div></div>
+    <div class="stat"><div class="k">P2P down</div><div class="v" id="p2pd">0</div></div>
+    <div class="stat"><div class="k">P2P up</div><div class="v" id="p2pu">0</div></div>
+  </div>
+  <p><small>Open this page in several tabs/machines on the same stream, then watch the
+    <a href="http://localhost:8001" style="color:#58a6ff">dashboard</a>. Offload climbs with viewer count.</small></p>
+
+  <script>
+    const cfg = window.P2P_DEMO;
+    // Random per-viewer id (no Math.random dependence on crypto: use crypto.randomUUID).
+    const clientId = crypto.randomUUID();
+
+    // Cumulative counters for THIS viewer. p2p-media-loader reports per-segment.
+    let httpBytes = 0, p2pBytes = 0, uploadBytes = 0, peers = 0;
+
+    const fmt = (b) => {
+      if (b < 1024) return b + " B";
+      const u = ["KB","MB","GB"]; let i = -1;
+      do { b /= 1024; i++; } while (b >= 1024 && i < u.length - 1);
+      return b.toFixed(1) + " " + u[i];
+    };
+    function paint() {
+      const total = httpBytes + p2pBytes;
+      document.getElementById("ratio").textContent = total ? Math.round((p2pBytes/total)*100)+"%" : "0%";
+      document.getElementById("peers").textContent = peers;
+      document.getElementById("http").textContent = fmt(httpBytes);
+      document.getElementById("p2pd").textContent = fmt(p2pBytes);
+      document.getElementById("p2pu").textContent = fmt(uploadBytes);
+    }
+
+    if (window.Hls && Hls.isSupported()) {
+      const HlsJsP2PEngine = window.p2pml.hlsjs.HlsJsP2PEngine;
+      const HlsWithP2P = HlsJsP2PEngine.injectMixin(window.Hls);
+
+      const hls = new HlsWithP2P({
+        // Sit WELL BACK from the live edge and buffer deep. p2p-media-loader always
+        // pulls the nearest segments (highDemandTimeWindow) over HTTP; only segments
+        // further back are eligible for P2P. Playing back from the edge with a deep
+        // buffer puts most wanted segments into that P2P zone -> mesh forms, offload
+        // climbs. Trades a few extra seconds of latency for offload (expected).
+        liveSyncDurationCount: 10,
+        backBufferLength: 60,
+        maxBufferLength: 120,        // deep forward buffer: puts many segments into the
+        maxMaxBufferLength: 180,     // P2P-eligible zone (beyond the ~5-seg high-demand edge)
+        p2p: {
+          core: {
+            swarmId: cfg.swarmId,
+            announceTrackers: cfg.announceTrackers,
+            rtcConfig: { iceServers: cfg.iceServers },
+            // Shrink the always-HTTP zone to the nearest 6s; everything older is P2P.
+            highDemandTimeWindow: 6,
+            httpDownloadTimeWindow: 6,
+            p2pDownloadTimeWindow: 60,
+          },
+          onHlsJsCreated(hls) {
+            const eng = hls.p2pEngine;
+            // Each loaded segment tells us where its bytes came from.
+            eng.addEventListener("onSegmentLoaded", (d) => {
+              const len = d.bytesLength || d.byteLength || 0;
+              if (d.downloadSource === "p2p") p2pBytes += len;
+              else httpBytes += len; // "http" (origin) or anything non-p2p
+              paint();
+            });
+            // Bytes WE served to other peers (our contribution to offloading origin).
+            eng.addEventListener("onSegmentUploaded", (d) => {
+              uploadBytes += (d.bytesLength || d.byteLength || 0);
+              paint();
+            });
+            eng.addEventListener("onPeerConnect", () => { peers++; paint(); });
+            eng.addEventListener("onPeerClose", () => { peers = Math.max(0, peers-1); paint(); });
+          },
+        },
+      });
+
+      window.__hls = hls; // expose for debugging/inspection
+      hls.attachMedia(document.getElementById("video"));
+      hls.loadSource(cfg.streamUrl);
+    } else {
+      document.body.insertAdjacentHTML("beforeend",
+        "<p style='color:#f85149'>hls.js/MSE not supported in this browser.</p>");
+    }
+
+    // Report cumulative counters to the dashboard aggregator.
+    setInterval(() => {
+      fetch(cfg.metricsUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // Date.now() is fine in the browser; the tracker/metrics server never runs
+        // inside a workflow sandbox, so no restriction here.
+        body: JSON.stringify({ clientId, httpBytes, p2pBytes, uploadBytes, ts: Date.now() }),
+      }).catch(() => {});
+    }, cfg.reportIntervalMs);
+  </script>
+</body>
+</html>

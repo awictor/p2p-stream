@@ -1,0 +1,21 @@
+{
+  "name": "p2p-stream-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MVP: prove P2P bandwidth offload for live browser streaming (hls.js + p2p-media-loader + WS tracker)",
+  "scripts": {
+    "tracker": "node server/tracker.js",
+    "web": "http-server web -p 5173 -c-1 --cors",
+    "origin:loop": "bash origin/segment.sh loop origin/sample.mp4",
+    "origin:rtmp": "bash origin/segment.sh rtmp",
+    "nginx": "bash origin/run-nginx.sh"
+  },
+  "dependencies": {
+    "bittorrent-tracker": "^11.2.1",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "http-server": "^14.1.1"
+  }
+}
