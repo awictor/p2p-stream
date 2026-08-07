@@ -1,8 +1,13 @@
 # P2P Live Streaming MVP — prove bandwidth offload
 
 Viewers relay live video segments to each other over WebRTC so the origin serves few
-and peers fan out the rest. This MVP proves offload works and **measures the ratio**
-(% bytes served peer-to-peer vs from origin). Live, browser-only.
+and peers fan out the rest, cutting the egress bill that dominates streaming costs.
+Live, browser-only, and it **measures the ratio** (% bytes served peer-to-peer vs origin).
+
+> **Status: the offload itself is not working yet — measured 0%.** The full pipeline runs
+> and everything around it is tested, but no peer ever connects, for a specific reason found
+> in the engine source. See [Status](#-status-offload-is-0--a-peer-bootstrap-deadlock-in-the-p2p-engine)
+> before trusting any number here.
 
 Not built from scratch: [`p2p-media-loader`](https://github.com/novage/p2p-media-loader)
 (OSS, MIT) does the mesh, WebRTC transfer, and HTTP fallback. We wire it to hls.js +
@@ -25,11 +30,17 @@ Viewer: <video> + hls.js + p2p-media-loader <--HTTP fallback-- |
 | `server/tracker.js` | WebSocket signaling (bittorrent-tracker) for peer discovery |
 | `server/metrics.js` + `dashboard.html` | aggregate P2P-vs-HTTP bytes → offload % dashboard |
 | `web/index.html` + `p2p-config.js` | viewer: hls.js + p2p-media-loader + stats reporting |
+| `test/verify-offload.js` | the offload harness — the only accepted proof (`npm run verify`) |
+| `test/metrics.test.js`, `test/tracker.test.js` | unit tests for the ratio maths and signaling (`npm test`) |
 
 ## Prereqs
 - Node 18+ (`crypto.randomUUID`, modern deps)
-- `ffmpeg` and `nginx` on PATH
+- `ffmpeg` and `nginx`. The scripts prefer portable copies under `bin/` if present
+  (`bin/ffmpeg-*/bin/ffmpeg.exe`, `bin/nginx-*/nginx.exe`) and fall back to PATH, so no
+  admin install is required. `bin/` is gitignored — download them yourself or install normally.
 - A sample video at `origin/sample.mp4` for loop mode (any mp4), or OBS for RTMP mode
+- Windows note: `origin/nginx.conf` sets `sendfile off`, which is REQUIRED there — with it on,
+  nginx caches file handles and 404s the rotating live segments.
 
 ## Run (4 terminals)
 ```bash
@@ -53,58 +64,80 @@ Open the dashboard: <http://localhost:8001>. Open viewers: <http://localhost:517
 > off-localhost requires **HTTPS + WSS everywhere** — WebRTC and MSE refuse insecure
 > contexts. Update URLs in `web/p2p-config.js`.
 
-## Verify (build order = proof)
-1. **Baseline.** One viewer tab → dashboard shows ~**0%** offload (only origin serves).
-2. **P2P kicks in.** Open 5–10 viewer tabs on the same stream → offload climbs to
-   **60–90%**. Each viewer card also shows its own peers + P2P bytes.
-3. **Ground truth.** Tail `origin/logs/egress.log` — origin `$body_bytes_sent` per
-   viewer drops as the swarm grows, independent of the JS counters.
-4. **Fallback.** Kill the tracker (`Ctrl-C` on terminal 3) mid-stream → all viewers
-   keep playing via HTTP origin. Playback never fully breaks.
-5. **Latency.** Confirm live delay stays a few seconds.
+## Verify
+Automated, no services needed:
+```bash
+npm test                  # 37 assertions: metrics aggregation (21) + tracker signaling (16)
+```
 
-## ⚠️ Status: offload is currently 0% — known cause, unsolved
+With the four services up:
+```bash
+npm run verify            # the ONLY accepted proof of offload
+```
+It drives 4 headless viewers, counts announces with/without `offers[]`, listens for the
+engine's own fault events, and prints a cause-specific diagnosis. Exit codes: **0** = real
+P2P bytes observed, **1** = stack ran but offload stayed 0%, **2** = stack not up.
+
+What currently passes: origin serves the playlist and segments, all four viewers play, byte
+accounting and the dashboard are exact, and killing the tracker mid-stream leaves playback
+running on HTTP fallback. What currently fails: `verify` exits 1 — see Status below.
+
+> A 90-fragment playlist needs ~180s of wall clock to fill before `verify` is meaningful.
+
+## ⚠️ Status: offload is 0% — a peer-bootstrap deadlock in the P2P engine
 
 **Honest state:** every part of the pipeline is verified except the thing the project exists
-to prove. `npm run verify` currently exits **1** — the stack runs, four viewers play, the
-tracker pairs them, but no peer-to-peer bytes move.
+to prove. `npm run verify` exits **1** — the stack runs, four viewers play, the tracker
+accepts their announces, but no peer ever connects so no peer-to-peer bytes move.
 
-Two gates inside the p2p-media-loader core fight each other:
+### The cause, read from the engine source
+In `web/vendor/p2pml-hlsjs.iife.min.js`, whether a segment may be fetched from a peer is:
 
-1. `jr()` zeroes **both** download windows when a viewer holds ≤5 segments ahead:
-   ```
-   t<=5 ? (httpDownloadTimeWindow=0, p2pDownloadTimeWindow=0)
-        : t<=10 && (p2pDownloadTimeWindow = httpDownloadTimeWindow)
-   ```
-2. Anything inside `highDemandTimeWindow` is HTTP-only regardless of gate 1.
+```js
+isP2PDownloadable: Nr(seg, playback, p2pDownloadTimeWindow)   // window is 6000s — always open
+                && registry.isSegmentLoadingOrLoadedBySomeone(seg)
 
-Measured (see `.p2p-loop/patterns.md`): leaving hls.js buffer keys unset lets the engine's
-auto-tune run (`liveSyncDurationCount→29`, `maxBufferLength→15`), giving a 15.4s / 7.7-segment
-buffer that clears gate 1 — but the same auto-tune sets `highDemandTimeWindow=15` ≥ that
-buffer, so every buffered segment stays HTTP-only. Forcing `highDemandTimeWindow=4` collapses
-the buffer to 3.8s / 1.9 segments, falling back under gate 1. Note that setting the buffer
-keys yourself *suppresses* the auto-tune entirely (the engine guards on `!userConfig.<key>`),
-so `web/index.html` deliberately leaves them alone.
+isSegmentLoadingOrLoadedBySomeone(seg) {
+  for (const peer of connectedPeers.values())
+    if (peer.getSegmentStatus(seg)) return true;
+  return false;                       // zero connected peers -> ALWAYS false
+}
+```
 
-Untried, in priority order: larger `-hls_time` (more seconds per segment may clear both gates
-at once); VOD with a genuinely deep buffer; a real second network so HTTP stops being
-instant-localhost.
+A segment is only P2P-eligible if an **already-connected** peer reports holding it. With no
+peers connected, nothing is eligible, so the download scheduler never queues a P2P request, so
+the tracker announce goes out with `offers:[]`, so no WebRTC offer is ever exchanged, so no peer
+connects. Chicken and egg.
 
-**What IS verified end-to-end:** origin pipeline (ffmpeg→CMAF→nginx, correct MIME/CORS), 4
-concurrent viewers playing, per-segment byte accounting, tracker peer pairing (`incomplete:N`),
-metrics aggregation + dashboard (exact on synthetic input), HTTP fallback, and headless WebRTC
-capability (offer + ICE). The plumbing is sound; the window math is the blocker.
+### What has been ruled out (measured, not assumed)
+- **Not the buffer/window math.** `p2pDownloadTimeWindow` is 6000s and was never the
+  constraint. Five config hypotheses died here — bigger `-hls_time`, removing our buffer
+  overrides, `highDemandTimeWindow`→8/→4, `lowLatencyMode:false`. Buffer knobs only affect
+  `isHighDemand`, never P2P eligibility.
+- **Not the tracker.** `npm run test:tracker` drives the WS protocol with two synthetic peers
+  and proves the server relays offers and routes answers correctly (16 assertions). An
+  `offers:[]` announce correctly triggers no relay — our exact symptom, as correct behaviour.
+- **Not config, and not a thrown error.** `webRtcOffersCount=5`, P2P enabled both directions,
+  tracker and swarmId set. `shouldGenerateOffers`/`claimPeer` are never overridden by the core,
+  so both default to true. The harness listens for the engine's `offer-failed` warning and sees
+  **zero faults** — so offer creation is not failing, it is never attempted.
+- **Not WebRTC availability.** Headless Chromium creates offers and gathers ICE fine.
+
+### What IS verified end-to-end
+Origin pipeline (ffmpeg→CMAF→nginx, correct MIME/CORS), 4 concurrent viewers playing,
+per-segment byte accounting, tracker announce handling and offer relay, metrics aggregation
+(37 assertions across `npm test`), HTTP fallback, headless WebRTC capability.
 
 ### Verify it yourself
 ```bash
+npm test                  # 37 assertions, ~5s, no services needed
 npm run verify            # exit 0 = real P2P bytes seen; 1 = offload still 0%; 2 = stack down
 ```
 
 ## Known limits (by design, for MVP)
-- Newest live-edge segment is always origin-served first, then propagates → caps max
-  offload near the live edge. Larger buffer/latency = more offload.
 - No TURN: symmetric-NAT peers can't P2P, fall back to HTTP (lower offload, not broken).
 - Small streams save little (few peers). Offload scales with viewer count.
+- Newest live-edge segment is origin-served first, then propagates.
 
 ## Deferred (not this MVP)
 Ad-free-for-relay reward tier, accounts, token incentive, browser broadcasting, TURN, mobile.
