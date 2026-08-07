@@ -11,6 +11,16 @@
  *
  * Usage:
  *   node test/verify-offload.js [--viewers 4] [--watch 90] [--stagger 5] [--headed]
+ *   node test/verify-offload.js --sweep 1,2,4,8 [--watch 45]
+ *
+ * --sweep runs the harness once per viewer count and prints a N -> offload% table, which
+ * is the economic claim (offload should RISE with swarm size). Two differences from a
+ * single run, both necessary for the number to mean anything:
+ *   1. It does NOT stop at the first P2P byte. A single run may exit early once offload is
+ *      proven, which samples the ratio at its lowest; a curve needs the full window.
+ *   2. It measures DELTAS of the /stats counters around each run. The metrics server never
+ *      evicts clients (see P2P-0010), so raw totals carry over between runs and would make
+ *      every later N look better than it is.
  *
  * Exit codes:
  *   0 = P2P bytes observed (offload > 0)          <- the only pass
@@ -34,6 +44,16 @@ const VIEWERS = arg("viewers", 4);
 const WATCH_S = arg("watch", 90);
 const STAGGER_S = arg("stagger", 5);
 const HEADED = process.argv.includes("--headed");
+
+// --sweep 1,2,4,8 -> run once per count and print the offload-vs-N curve.
+const sweepArg = (() => {
+  const i = process.argv.indexOf("--sweep");
+  if (i === -1) return null;
+  const raw = process.argv[i + 1];
+  if (!raw || raw.startsWith("--")) return [1, 2, 4, 8];
+  const ns = raw.split(",").map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n > 0);
+  return ns.length ? ns : null;
+})();
 
 // This package is "type":"module", so there is no bare `require` here. Playwright is a
 // CommonJS dep living OUTSIDE this repo, so build a require() bound to this file's URL.
@@ -86,10 +106,20 @@ async function preflight() {
   }
 }
 
-(async () => {
+// One measured run at a given viewer count. `stopEarly` short-circuits as soon as any P2P
+// byte appears (right for a pass/fail gate, wrong for measuring a ratio). Returns a summary
+// so the sweep can tabulate; also sets process.exitCode for single-run use.
+async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER_S, stopEarly = true } = {}) {
+  const VIEWERS = viewers;
+  const WATCH_S = watchS;
+  const STAGGER_S = staggerS;
   console.log(`verify-offload: ${VIEWERS} viewers, ${WATCH_S}s watch, ${STAGGER_S}s stagger`);
   console.log("preflight:");
   await preflight();
+
+  // Snapshot the counters first: the metrics server never evicts clients, so totals carry
+  // over between runs and only the delta describes THIS run.
+  const before = await getJson(STATS_URL);
 
   const { chromium } = loadPlaywright();
   const browser = await chromium.launch({
@@ -110,6 +140,7 @@ async function preflight() {
   let answers = 0;
   // Engine-reported faults (notably "offer-failed"), collected across all viewers.
   const engineFaults = [];
+  let summary = null;
 
   try {
     for (let i = 0; i < VIEWERS; i++) {
@@ -190,7 +221,9 @@ async function preflight() {
       const pct = Math.round(last.offloadRatio * 100);
       const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
       console.log(`  viewers=${last.viewers} http=${mb(last.httpBytes)} p2p=${mb(last.p2pBytes)} up=${mb(last.uploadBytes)} offload=${pct}% (${left}s left)`);
-      if (last.p2pBytes > 0) break; // proven; no need to keep burning the window
+      // Only a pass/fail gate may exit here. A sweep must burn the whole window or it
+      // samples the ratio at its lowest point and understates every N.
+      if (stopEarly && last.p2pBytes > 0) break;
     }
 
     console.log("\nper-viewer:");
@@ -207,10 +240,22 @@ async function preflight() {
 
     const final = last || (await getJson(STATS_URL));
     const pct = Math.round(final.offloadRatio * 100);
+    // Delta-based ratio: what THIS run contributed, ignoring counters left by earlier runs.
+    const dHttp = Math.max(0, final.httpBytes - before.httpBytes);
+    const dP2p = Math.max(0, final.p2pBytes - before.p2pBytes);
+    const dUp = Math.max(0, final.uploadBytes - before.uploadBytes);
+    const dTotal = dHttp + dP2p;
+    const dPct = dTotal ? Math.round((dP2p / dTotal) * 100) : 0;
     console.log(`\nsegments via p2p: ${p2pSegments} | peer connects: ${peerConnects}`);
     console.log(`signaling: announces with offers=${announcesWithOffers}, with offers:[]=${announcesNoOffers}, offer/answer frames received=${answers}`);
     console.log(`engine faults: ${engineFaults.length}${engineFaults.length ? ` (first: ${engineFaults[0]})` : ""}`);
-    console.log(`aggregate offload: ${pct}% (p2p=${mb(final.p2pBytes)} http=${mb(final.httpBytes)})`);
+    console.log(`aggregate offload: ${pct}% cumulative (p2p=${mb(final.p2pBytes)} http=${mb(final.httpBytes)})`);
+    console.log(`this run only:    ${dPct}% (p2p=${mb(dP2p)} http=${mb(dHttp)} up=${mb(dUp)})`);
+
+    summary = {
+      viewers: VIEWERS, offloadPct: dPct, p2pBytes: dP2p, httpBytes: dHttp, uploadBytes: dUp,
+      p2pSegments, peerConnects, pass: dP2p > 0 && p2pSegments > 0,
+    };
 
     if (final.p2pBytes > 0 && p2pSegments > 0) {
       console.log("\nPASS: real peer-to-peer bytes observed.");
@@ -242,6 +287,57 @@ async function preflight() {
     }
   } finally {
     await browser.close();
+  }
+  return summary;
+}
+
+(async () => {
+  if (!sweepArg) {
+    await runOnce();
+    return;
+  }
+
+  console.log(`SWEEP: viewer counts ${sweepArg.join(", ")} — ${WATCH_S}s watch each\n`);
+  const rows = [];
+  for (const n of sweepArg) {
+    console.log(`${"=".repeat(60)}\n=== N=${n}\n${"=".repeat(60)}`);
+    // stopEarly:false so each N burns the full window and the ratio is comparable.
+    const r = await runOnce({ viewers: n, stopEarly: false });
+    if (r) rows.push(r);
+    // Let the previous run's viewers age out of the active count before the next one.
+    await sleep(3000);
+  }
+
+  console.log(`\n${"=".repeat(60)}\nOFFLOAD vs VIEWER COUNT\n${"=".repeat(60)}`);
+  console.log("| viewers | offload | p2p bytes | http bytes | p2p segs | peer conns |");
+  console.log("|---------|---------|-----------|------------|----------|------------|");
+  for (const r of rows) {
+    console.log(`| ${String(r.viewers).padStart(7)} | ${String(r.offloadPct + "%").padStart(7)} | ${mb(r.p2pBytes).padStart(9)} | ${mb(r.httpBytes).padStart(10)} | ${String(r.p2pSegments).padStart(8)} | ${String(r.peerConnects).padStart(10)} |`);
+  }
+  console.log("\ncsv:");
+  console.log("viewers,offload_pct,p2p_bytes,http_bytes,p2p_segments,peer_connects");
+  for (const r of rows) {
+    console.log(`${r.viewers},${r.offloadPct},${r.p2pBytes},${r.httpBytes},${r.p2pSegments},${r.peerConnects}`);
+  }
+
+  // N=1 is EXPECTED to be 0%: a solo viewer has no peer to pull from, so zero P2P bytes is
+  // the correct result, not a failure. Only multi-viewer counts must produce P2P bytes.
+  const solo = rows.filter((r) => r.viewers === 1);
+  for (const r of solo) {
+    console.log(`\nnote: N=1 measured ${r.offloadPct}% — expected, a lone viewer has no peer.` +
+      (r.p2pBytes > 0 ? " NONZERO here would be suspicious." : ""));
+  }
+  const failed = rows.filter((r) => r.viewers > 1 && !r.pass).map((r) => r.viewers);
+  if (rows.length >= 2) {
+    const first = rows[0], lastRow = rows[rows.length - 1];
+    console.log(`trend: N=${first.viewers} -> ${first.offloadPct}%, N=${lastRow.viewers} -> ${lastRow.offloadPct}% (${lastRow.offloadPct > first.offloadPct ? "rising" : "NOT rising"})`);
+  }
+  if (failed.length) {
+    console.log(`\nFAIL(1): no P2P bytes at viewer count(s): ${failed.join(", ")}`);
+    process.exitCode = 1;
+  } else {
+    console.log("\nPASS: every multi-viewer count produced real peer-to-peer bytes.");
+    process.exitCode = 0;
   }
 })().catch((e) => {
   console.error("ERROR:", e.message);
