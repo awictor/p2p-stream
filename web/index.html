@@ -77,18 +77,27 @@
         // max(2*td, hd), so either buffer == hd (gate 2 fails) or buffer == 2*td, i.e. only
         // 2 segments ahead (gate 1 fails). No -hls_time value escapes that.
         //
-        // So: leave liveSyncDurationCount UNSET (auto-tune sits us ~29 segments back from the
-        // live edge, giving playlist depth to buffer into) but set maxBufferLength ourselves,
-        // suppressing only the tune that would clamp it back down to 15.
-        // Result at targetduration=2: 60s buffered = 30 segments ahead (gate 1 ok) and
-        // 60 > 15 (gate 2 ok). Costs ~30s of latency behind live, which is the trade.
+        // So: leave liveSyncDurationCount UNSET (the auto-tune parks us ~60 segments back from
+        // the live edge on a 90-fragment playlist, giving depth to buffer into) but set
+        // maxBufferLength ourselves, suppressing only the tune that would clamp it to 15.
+        //
+        // NOTE (measured iter 2): maxBufferLength is NOT the binding constraint on a live
+        // stream. hls.js holds the live sync point (latency 121.1 vs targetLatency 120 = LSDC
+        // 60 x td 2) and refuses to run further ahead, so the buffer plateaus at ~15.4s
+        // regardless. Kept because it removes the engine's clamp; it just isn't the lever.
         maxBufferLength: 60,
         p2p: {
           core: {
             swarmId: cfg.swarmId,
             announceTrackers: cfg.announceTrackers,
             rtcConfig: { iceServers: cfg.iceServers },
-            // Download-window defaults are left alone on purpose. They interact with the
+            // DO NOT lower highDemandTimeWindow to widen the P2P margin — measured dead at
+            // iter 3. The buffer is sized FROM it (maxBufferLength auto-tune = max(2*td, hd)),
+            // so lowering hd lowers the buffer by the same amount and the P2P-eligible slice
+            // stays pinned at ~0.4s: hd=15 -> buffer 15.4 (segsAhead 7.7), hd=8 -> buffer 8.4
+            // (segsAhead 4.2, which then trips gate 1). The two gates are structurally coupled
+            // through hd; the margin cannot be widened from this knob.
+            // Other download-window defaults are left alone on purpose. They interact with the
             // buffer auto-tune above; hand-tuning them was part of what kept P2P off.
           },
           onHlsJsCreated(hls) {

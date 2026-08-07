@@ -101,11 +101,30 @@ async function preflight() {
   const pages = [];
   let peerConnects = 0;
   let p2pSegments = 0;
+  // Signaling counters. A 0% result means very different things depending on whether the
+  // engine ever ASKED for a peer: announces carrying a non-empty offers[] mean it wanted
+  // P2P and negotiation failed; announces with offers:[] mean the download scheduler never
+  // queued a P2P request in the first place (a window-math problem, not a WebRTC one).
+  let announcesWithOffers = 0;
+  let announcesNoOffers = 0;
+  let answers = 0;
 
   try {
     for (let i = 0; i < VIEWERS; i++) {
       const page = await ctx.newPage();
       page.on("pageerror", (e) => console.log(`  [tab${i}] pageerror: ${e.message}`));
+      page.on("websocket", (ws) => {
+        ws.on("framesent", (f) => {
+          const s = typeof f.payload === "string" ? f.payload : "";
+          if (!s.includes('"announce"')) return;
+          if (/"offers":\[\s*\]/.test(s)) announcesNoOffers++;
+          else if (s.includes('"offers"')) announcesWithOffers++;
+        });
+        ws.on("framereceived", (f) => {
+          const s = typeof f.payload === "string" ? f.payload : "";
+          if (s.includes('"answer"') || s.includes('"offer"')) answers++;
+        });
+      });
       page.on("console", (m) => {
         const t = m.text();
         if (t.startsWith("P2PSEG")) { p2pSegments++; console.log(`  [tab${i}] ${t}`); }
@@ -167,6 +186,7 @@ async function preflight() {
     const final = last || (await getJson(STATS_URL));
     const pct = Math.round(final.offloadRatio * 100);
     console.log(`\nsegments via p2p: ${p2pSegments} | peer connects: ${peerConnects}`);
+    console.log(`signaling: announces with offers=${announcesWithOffers}, with offers:[]=${announcesNoOffers}, offer/answer frames received=${answers}`);
     console.log(`aggregate offload: ${pct}% (p2p=${mb(final.p2pBytes)} http=${mb(final.httpBytes)})`);
 
     if (final.p2pBytes > 0 && p2pSegments > 0) {
@@ -174,10 +194,18 @@ async function preflight() {
       process.exitCode = 0;
     } else {
       console.log("\nFAIL(1): no P2P bytes in the watch window. Offload is unproven.");
-      console.log("  Next checks: (a) did the tracker log peer announces with a non-empty");
-      console.log("  offers[] array? (b) is web/index.html still overriding hls.js buffer");
-      console.log("  config (that suppresses the engine's P2P-window auto-tune)? (c) a");
-      console.log("  same-box origin may simply be too fast — try the two-machine run.");
+      if (announcesWithOffers === 0) {
+        console.log("  DIAGNOSIS: every announce carried offers:[] — the engine never asked for");
+        console.log("  a peer, so this is the download scheduler / window math, NOT WebRTC.");
+        console.log("  Check buffer depth vs highDemandTimeWindow and segments-ahead > 5.");
+      } else if (peerConnects === 0) {
+        console.log(`  DIAGNOSIS: ${announcesWithOffers} announces DID carry offers but no peer`);
+        console.log("  connected — this is signaling/WebRTC negotiation, not window math.");
+        console.log("  Check the tracker relays offers to other peers and STUN reachability.");
+      } else {
+        console.log("  DIAGNOSIS: peers connected but served no segments — check that a peer");
+        console.log("  actually holds the wanted segment (buffer overlap) and upload is enabled.");
+      }
       process.exitCode = 1;
     }
   } finally {
