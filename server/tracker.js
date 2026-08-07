@@ -24,7 +24,6 @@ const tracker = new Server({
 tracker.on("error", (err) => console.error("[tracker] error:", err.message));
 tracker.on("warning", (err) => console.warn("[tracker] warn:", err.message));
 
-let peakClients = 0;
 tracker.on("start", () => {
   const n = Object.keys(tracker.torrents).length;
   console.log(`[tracker] peer announced; active swarms: ${n}`);
