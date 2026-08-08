@@ -5,6 +5,8 @@
   "type": "module",
   "description": "MVP: prove P2P bandwidth offload for live browser streaming (hls.js + p2p-media-loader + WS tracker)",
   "scripts": {
+    "start": "bash start.sh",
+    "start:vod": "bash start.sh vod origin/vod.mp4",
     "tracker": "node server/tracker.js",
     "web": "http-server web -p 5173 -c-1 --cors",
     "origin:loop": "bash origin/segment.sh loop origin/sample.mp4",

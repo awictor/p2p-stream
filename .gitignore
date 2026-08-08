@@ -16,3 +16,5 @@ origin/temp/
 # Scratch
 *.log
 /tmp/
+# start.sh writes this probe helper at runtime and removes it on exit
+.probe.mjs

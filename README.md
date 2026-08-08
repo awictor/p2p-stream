@@ -32,7 +32,8 @@ Viewer: <video> + hls.js + p2p-media-loader <--HTTP fallback-- |
 | `server/metrics.js` + `dashboard.html` | aggregate P2P-vs-HTTP bytes → offload % dashboard |
 | `web/index.html` + `p2p-config.js` | viewer: hls.js + p2p-media-loader + stats reporting |
 | `test/verify-offload.js` | the offload harness — the only accepted proof (`npm run verify`) |
-| `test/metrics.test.js`, `test/tracker.test.js` | unit tests for the ratio maths and signaling (`npm test`) |
+| `test/*.test.js` | unit tests: ratio maths, signaling, viewer config, dashboard (`npm test`) |
+| `start.sh` | one-command bring-up of all four services, waits for real readiness (`npm start`) |
 
 ## Prereqs
 - Node 18+ (`crypto.randomUUID`, modern deps)
@@ -43,23 +44,33 @@ Viewer: <video> + hls.js + p2p-media-loader <--HTTP fallback-- |
 - Windows note: `origin/nginx.conf` sets `sendfile off`, which is REQUIRED there — with it on,
   nginx caches file handles and 404s the rotating live segments.
 
-## Run (4 terminals)
+## Run (one command)
 ```bash
 npm install
-
-# 1) origin segmenter — loop a local file as a fake live stream
-npm run origin:loop            # (or: npm run origin:rtmp, then stream from OBS)
-
-# 2) origin static server (serves the segments)
-npm run nginx                  # http://localhost:8080/hls/stream.m3u8
-
-# 3) tracker + metrics dashboard
-npm run tracker                # ws://localhost:8000  +  http://localhost:8001
-
-# 4) viewer web app
-npm run web                    # http://localhost:5173
+npm start                      # or: bash start.sh
 ```
-Open the dashboard: <http://localhost:8001>. Open viewers: <http://localhost:5173>.
+`start.sh` starts all four services, then **waits for real readiness** before printing URLs —
+it polls until the playlist exists and holds ≥20 fragments, because a playlist with 2 fragments
+plays but measures ~0% offload, which looks like a broken product rather than an impatient
+operator. In live mode ffmpeg buffers before it writes the playlist at all, so first output
+takes ~90s. Ctrl-C stops everything it started.
+
+```bash
+npm run start:vod              # segment origin/vod.mp4 instead — no ~90s live wait
+bash start.sh rtmp             # ingest OBS at rtmp://localhost:1935/live/stream
+```
+
+Then open the dashboard <http://localhost:8001> and the viewer <http://localhost:5173> in 2+ tabs.
+
+<details><summary>Or run the four services by hand (4 terminals)</summary>
+
+```bash
+npm run origin:loop            # 1) segmenter (or: npm run origin:rtmp, then stream from OBS)
+npm run nginx                  # 2) origin      http://localhost:8080/hls/stream.m3u8
+npm run tracker                # 3) tracker ws://localhost:8000 + metrics :8001
+npm run web                    # 4) viewer      http://localhost:5173
+```
+</details>
 
 > Local dev uses `ws://` and `http://` on localhost (allowed secure context). Deploying
 > off-localhost requires **HTTPS + WSS everywhere** — WebRTC and MSE refuse insecure
@@ -68,7 +79,7 @@ Open the dashboard: <http://localhost:8001>. Open viewers: <http://localhost:517
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 37 assertions: metrics aggregation (21) + tracker signaling (16)
+npm test                  # 112 assertions: metrics (37) + tracker (15) + config (36) + dashboard (24)
 ```
 
 With the four services up:
