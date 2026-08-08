@@ -10,9 +10,10 @@
     "origin:loop": "bash origin/segment.sh loop origin/sample.mp4",
     "origin:rtmp": "bash origin/segment.sh rtmp",
     "nginx": "bash origin/run-nginx.sh",
-    "test": "node test/metrics.test.js && node test/tracker.test.js",
+    "test": "node test/metrics.test.js && node test/tracker.test.js && node test/config.test.js",
     "test:metrics": "node test/metrics.test.js",
     "test:tracker": "node test/tracker.test.js",
+    "test:config": "node test/config.test.js",
     "verify": "node test/verify-offload.js",
     "verify:sweep": "node test/verify-offload.js --sweep 1,2,4,8 --watch 45"
   },
