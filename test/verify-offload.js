@@ -561,7 +561,10 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
 
     summary = {
       viewers: VIEWERS, offloadPct: dPct, p2pBytes: dP2p, httpBytes: dHttp, uploadBytes: dUp,
-      p2pSegments, peerConnects, pass: dP2p > 0 && p2pSegments > 0,
+      p2pSegments, peerConnects,
+      // SAME function the single-run verdict uses, so --sweep and a single run can never
+      // disagree about what a pass is again (they did: delta vs cumulative).
+      pass: offloadVerdict({ p2pBytes: dP2p, p2pSegments }).pass,
       // Cost side, carried out so --control can tabulate the two arms against each other.
       p2p, stalls: totalStalls, stallS: +totalStallS.toFixed(1), avgLatency: avgLat,
       upPerViewer, ledger, heldS, bytesPerVideoS,
@@ -625,11 +628,15 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
     // that the flag worked); here we just report and leave the exit code alone.
     if (!p2p) {
       console.log(`\ncontrol arm (p2p=off): ${dPct}% offload, ${p2pSegments} p2p segments — 0 is the expected result.`);
-    } else if (final.p2pBytes > 0 && p2pSegments > 0) {
+    } else if (offloadVerdict({ p2pBytes: dP2p, p2pSegments, cumulativeP2pBytes: final.p2pBytes }).pass) {
+      // Judged on the DELTA, not the cumulative counter. See offloadVerdict() — reading
+      // final.p2pBytes here let a run that relayed nothing pass on a previous run's total.
       console.log("\nPASS: real peer-to-peer bytes observed.");
       process.exitCode = 0;
     } else {
-      console.log("\nFAIL(1): no P2P bytes in the watch window. Offload is unproven.");
+      const v = offloadVerdict({ p2pBytes: dP2p, p2pSegments, cumulativeP2pBytes: final.p2pBytes });
+      console.log(`\nFAIL(1): ${v.reason}. Offload is unproven.`);
+      if (v.staleWarning) console.log(`  ⚠ ${v.staleWarning}`);
       if (announcesWithOffers === 0) {
         console.log("  DIAGNOSIS: every announce carried offers:[] — no WebRTC offer was ever");
         console.log("  generated, so no peer can connect, and with zero connected peers no");
@@ -672,6 +679,48 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
 // Classify one participation row against the full-participation reference. Pure, so the
 // thresholds that decide the PUBLISHED conclusion ("graceful" vs "collapse") are testable rather
 // than only reachable through a 10-minute browser sweep.
+/**
+ * THE PASS/FAIL VERDICT — the single decision this whole harness exists to make.
+ *
+ * Extracted iter 60, and extracting it exposed a real bug. The verdict was written inline as
+ * `final.p2pBytes > 0 && p2pSegments > 0` — the CUMULATIVE counter — while the summary object
+ * that `--sweep` judges on used `dP2p > 0` (the DELTA for this run). Those disagree on a warm
+ * metrics server: counters carry over between runs (the server evicts clients, not totals), so a
+ * run that relayed nothing of its own still sees `final.p2pBytes > 0` from an earlier run and
+ * **exits 0 = PASS**. The only accepted proof of offload could pass on a stale number.
+ *
+ * The delta is the correct basis, for exactly the reason `--sweep` already used it. `p2pBytes`
+ * here is the delta; `cumulativeP2pBytes` is accepted only so the mismatch can be REPORTED
+ * rather than silently resolved — if the two disagree the run says so.
+ *
+ * Returns { pass, code, reason, staleWarning }. `code` is the process exit code: 0 = real P2P
+ * bytes this run, 1 = ran but proved nothing. The control arm (`p2p:false`) is judged nowhere
+ * near here — 0% is its EXPECTED result, so applying this verdict to it would invert the meaning.
+ */
+export function offloadVerdict({ p2pBytes, p2pSegments, cumulativeP2pBytes = null }) {
+  const bytes = Number(p2pBytes) || 0;
+  const segs = Number(p2pSegments) || 0;
+  // BOTH conditions matter: bytes without segments means the byte counter moved for a reason the
+  // segment listener never saw (an accounting bug), and segments without bytes means the reverse.
+  const pass = bytes > 0 && segs > 0;
+  // Surface the stale-counter case explicitly. This is the exact condition the old inline verdict
+  // read as a pass, so it gets named rather than merely handled.
+  const staleWarning = (!pass && Number(cumulativeP2pBytes) > 0)
+    ? `cumulative p2pBytes is ${cumulativeP2pBytes} but THIS RUN contributed ${bytes} — ` +
+      "a carried-over counter is not proof. Restart the metrics server for a clean read."
+    : null;
+  return {
+    pass,
+    code: pass ? 0 : 1,
+    reason: pass
+      ? "real peer-to-peer bytes observed"
+      : (segs === 0 && bytes === 0 ? "no P2P bytes and no P2P segments in the watch window"
+        : segs === 0 ? "P2P bytes counted but no segment was reported P2P — accounting mismatch"
+        : "P2P segments reported but zero bytes — accounting mismatch"),
+    staleWarning,
+  };
+}
+
 export function participationVerdict({ pct, relayers, savedPct, fullPct, fullSavedPct }) {
   // A single relayer has no peer to pull from, so 0% is arithmetic, not a measurement. Calling
   // that a collapse would report a certainty as a finding.
