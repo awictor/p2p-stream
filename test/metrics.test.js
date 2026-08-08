@@ -95,6 +95,35 @@ const T = 1_700_000_000_000;
     check("boundary viewer counted active", s.viewers, 3);
   }
 
+  console.log("\nlong-gone viewer is EVICTED from the Map but its bytes survive:");
+  {
+    // A viewer beyond EVICT_MS (20x STALE_MS) must be reclaimed so the Map cannot grow
+    // without bound, WITHOUT subtracting bytes it really served — deleting them outright
+    // would make offloadRatio jump backwards and break the sweep's delta arithmetic.
+    const before = await stats();
+    await post({ clientId: "ancient", httpBytes: 40, p2pBytes: 60, uploadBytes: 7, ts: T - STALE_MS * 20 - 1 });
+    const s = await stats();
+    check("evicted, so not tracked in the Map", s.tracked, before.tracked);
+    check("counted as retired", s.retiredClients, 1);
+    check("its httpBytes still in the total", s.httpBytes, before.httpBytes + 40);
+    check("its p2pBytes still in the total", s.p2pBytes, before.p2pBytes + 60);
+    check("its uploadBytes still in the total", s.uploadBytes, before.uploadBytes + 7);
+    check("not counted as an active viewer", s.viewers, before.viewers);
+  }
+
+  console.log("\ntotals never move backwards across an eviction:");
+  {
+    const a1 = await stats();
+    for (let i = 0; i < 3; i++) {
+      await post({ clientId: `old${i}`, httpBytes: 5, p2pBytes: 5, ts: T - STALE_MS * 30 });
+    }
+    const a2 = await stats();
+    check("httpBytes monotonic", a2.httpBytes >= a1.httpBytes, true);
+    check("p2pBytes monotonic", a2.p2pBytes >= a1.p2pBytes, true);
+    check("Map stayed bounded (all 3 evicted)", a2.tracked, a1.tracked);
+    check("retired count grew by 3", a2.retiredClients, a1.retiredClients + 3);
+  }
+
   console.log("\n100% and 0% offload edges:");
   {
     const p = Number(process.env.METRICS_TEST_PORT2 || 8124);

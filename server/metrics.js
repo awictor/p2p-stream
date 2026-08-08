@@ -22,7 +22,19 @@ export function startMetrics(port) {
 
   // clientId -> latest cumulative counters + lastSeen (ms epoch, from client).
   const clients = new Map();
-  const STALE_MS = 15000; // drop a viewer from "active" if silent this long
+  const STALE_MS = 15000; // drop a viewer from the ACTIVE count if silent this long
+  // Long-gone viewers are evicted from the Map so it cannot grow without bound on a
+  // long-running dashboard. EVICT_MS is deliberately much larger than STALE_MS: a
+  // viewer that goes quiet briefly should stop counting as active but keep its entry,
+  // so a later report updates in place instead of double-counting.
+  const EVICT_MS = STALE_MS * 20; // 5 minutes
+
+  // Evicted clients' counters are FOLDED IN HERE rather than discarded. Reports are
+  // cumulative snapshots, so deleting an entry would subtract bytes that really were
+  // served and make offloadRatio jump backwards — which would also break the sweep's
+  // delta arithmetic and contradict the published numbers. Session totals stay
+  // monotonic; only the per-client bookkeeping is reclaimed.
+  const retired = { httpBytes: 0, p2pBytes: 0, uploadBytes: 0, count: 0 };
 
   app.post("/metrics", (req, res) => {
     const { clientId, httpBytes = 0, p2pBytes = 0, uploadBytes = 0, ts } = req.body || {};
@@ -43,7 +55,23 @@ export function startMetrics(port) {
     // "active" = reported within STALE_MS of the newest report we hold.
     let newest = 0;
     for (const c of clients.values()) newest = Math.max(newest, c.lastSeen);
-    let http = 0, p2p = 0, upload = 0, active = 0;
+
+    // Reclaim entries far older than the stale window, folding their bytes into
+    // `retired` so the totals below are unchanged by the eviction itself.
+    if (newest) {
+      for (const [id, c] of clients) {
+        if (c.lastSeen && newest - c.lastSeen > EVICT_MS) {
+          retired.httpBytes += c.httpBytes;
+          retired.p2pBytes += c.p2pBytes;
+          retired.uploadBytes += c.uploadBytes;
+          retired.count += 1;
+          clients.delete(id);
+        }
+      }
+    }
+
+    let http = retired.httpBytes, p2p = retired.p2pBytes, upload = retired.uploadBytes;
+    let active = 0;
     for (const c of clients.values()) {
       const stale = newest && c.lastSeen && newest - c.lastSeen > STALE_MS;
       http += c.httpBytes;
@@ -58,6 +86,8 @@ export function startMetrics(port) {
       p2pBytes: p2p,            // bytes pulled peer-to-peer across the swarm
       uploadBytes: upload,      // bytes served to peers across the swarm
       offloadRatio: total ? p2p / total : 0, // <- the number the whole MVP exists to show
+      tracked: clients.size,    // live entries in the Map (bounded — see EVICT_MS)
+      retiredClients: retired.count,
     };
   }
 
