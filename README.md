@@ -80,8 +80,8 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 448 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
-                          #                 ledger 37, claim 19, participation 35, forgery 29, sybil 29, origin 42
+npm test                  # 456 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
+                          #                 ledger 37, claim 27, participation 35, forgery 29, sybil 29, origin 42
 ```
 
 With the four services up:
@@ -92,6 +92,13 @@ npm run verify:control    # P2P ON vs OFF, side by side (~2min)
 npm run verify:windows    # sweep p2pDownloadTimeWindow: saving vs viewer cost (~5min)
 npm run verify:participation  # saving vs % of viewers who actually relay (~5min)
 ```
+`verify` also cross-checks the **dashboard** against itself: it recomputes what the page renders
+from the same `/stats` payload and exits 2 if the arithmetic drifts. When the metrics counters
+started clean it additionally asserts the on-screen figure equals the measured run. If earlier runs
+left counters behind it says so instead — the dashboard shows a *cumulative* ratio while the harness
+quotes *this run*, so on a warm server the two legitimately differ (measured: 59% vs 40%) and
+demanding equality would fail a correct system.
+
 It drives 4 headless viewers, counts announces with/without `offers[]`, listens for the
 engine's own fault events, and prints a cause-specific diagnosis on failure. Exit codes:
 **0** = real P2P bytes observed (current state), **1** = stack ran but offload stayed 0%,

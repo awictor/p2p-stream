@@ -422,6 +422,35 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
     console.log(`aggregate offload: ${pct}% cumulative (p2p=${mb(final.p2pBytes)} http=${mb(final.httpBytes)})`);
     console.log(`this run only:    ${dPct}% (p2p=${mb(dP2p)} http=${mb(dHttp)} up=${mb(dUp)})`);
 
+    // DASHBOARD AGREEMENT. The dashboard renders `Math.round(s.offloadRatio * 100)` from this
+    // same /stats payload, so the on-screen figure is exactly `pct` — and a human was being
+    // asked to eyeball that (a manual-QA box since iter 10). Assert it instead.
+    //
+    // The honest subtlety, and why this is not just `pct === dPct`: the dashboard shows the
+    // CUMULATIVE ratio while the harness quotes THIS RUN's delta. On a stack that has served
+    // earlier runs the two legitimately differ, so demanding equality would fail on a correct
+    // system. What must hold is that the dashboard's number is reproducible from the payload
+    // and that the two agree WHEN the counters started clean.
+    const dashPct = Math.round(final.offloadRatio * 100);
+    if (dashPct !== pct) {
+      console.error(`\nFAIL(2): dashboard arithmetic drifted — offloadRatio*100 rounds to ${dashPct}, printed ${pct}.`);
+      process.exit(2);
+    }
+    const priorBytes = before.httpBytes + before.p2pBytes;
+    if (priorBytes === 0) {
+      // Clean counters: cumulative IS this run, so the dashboard and the harness must match.
+      // ±1 point for independent rounding of the same two byte totals.
+      if (Math.abs(dashPct - dPct) > 1) {
+        console.error(`\nFAIL(2): counters started clean but dashboard says ${dashPct}% and this run measured ${dPct}%.`);
+        console.error("  Same bytes, two answers — one of the two aggregations is wrong.");
+        process.exit(2);
+      }
+      console.log(`dashboard agrees: ${dashPct}% on screen == ${dPct}% measured (counters were clean)`);
+    } else {
+      console.log(`dashboard shows ${dashPct}% CUMULATIVE (${mb(priorBytes)} carried in from earlier runs);` +
+        ` this run alone is ${dPct}%. Not comparable — restart the metrics server for a clean read.`);
+    }
+
     // THE COST SIDE. Printed immediately after the savings so the two are never separated:
     // "79% cheaper" is not a shippable claim until it reads "and playback was no worse".
     const totalStalls = qoe.reduce((a, v) => a + v.stalls, 0);
@@ -674,6 +703,25 @@ export function forgerySignals(uploadByClient = {}, attestedByClient = {}, { tol
       .filter(([k]) => k.startsWith("unmapped:"))
       .reduce((a, [, v]) => a + (Number(v) || 0), 0),
   };
+}
+
+/**
+ * The ⚠ skew warning, as LINES rather than console.log calls, so a test can assert that it
+ * actually fires. Extracted iter 53: `claim.test.js` already covered the skew ARITHMETIC
+ * (videoSkewPct), but nothing checked that the harness EMITS the warning — so a run whose arms
+ * played unequal video could have published a raw subtraction silently. The arithmetic being
+ * right does not help if the number never reaches the reader.
+ *
+ * Returns [] when there is nothing to warn about. The 3% threshold is the same one the README
+ * documents; below it the raw and normalised figures agree closely enough to be interchangeable.
+ */
+export function skewWarning(claim, offHeldS, onHeldS) {
+  if (claim.videoSkewPct === null || claim.videoSkewPct <= 3) return [];
+  return [
+    `  ⚠ the arms obtained ${claim.videoSkewPct}% different video (${offHeldS.toFixed(0)}s vs ${onHeldS.toFixed(0)}s),`,
+    `    so the raw byte subtraction would have claimed -${claim.rawSavedPct}%. Quote the`,
+    `    per-video-second figure (-${claim.savedPct}%); the raw one credits P2P for video it did not serve.`,
+  ];
 }
 
 export function claimNumbers(on, off) {
@@ -991,11 +1039,7 @@ async function runControl() {
     console.log(`  That subtraction — not the offload ratio — is the bill a platform stops paying.`);
     // If the arms obtained materially different amounts of video, the raw byte subtraction
     // credits P2P for video it never delivered. Say so rather than quietly publishing it.
-    if (claim.videoSkewPct !== null && claim.videoSkewPct > 3) {
-      console.log(`  ⚠ the arms obtained ${claim.videoSkewPct}% different video (${off.heldS.toFixed(0)}s vs ${on.heldS.toFixed(0)}s),`);
-      console.log(`    so the raw byte subtraction would have claimed -${claim.rawSavedPct}%. Quote the`);
-      console.log(`    per-video-second figure (-${savedPct}%); the raw one credits P2P for video it did not serve.`);
-    }
+    for (const line of skewWarning(claim, off.heldS, on.heldS)) console.log(line);
     if (savedPct < on.offloadPct) {
       console.log(`  NOTE: the real saving (-${savedPct}%) is SMALLER than the ${on.offloadPct}% offload ratio,`);
       console.log(`  because the P2P arm fetched more total bytes. Quote -${savedPct}%, not ${on.offloadPct}%.`);

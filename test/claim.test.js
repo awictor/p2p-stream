@@ -17,7 +17,7 @@
  *
  * Usage: node test/claim.test.js     (exit 0 = pass, 1 = fail)
  */
-import { claimNumbers } from "./verify-offload.js";
+import { claimNumbers, skewWarning } from "./verify-offload.js";
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -101,6 +101,36 @@ console.log("\nsavedBytes stays a raw byte figure (it is quoted as MB, not as a 
 {
   const c = claimNumbers({ httpBytes: 74.8e6, heldS: 472 }, { httpBytes: 151.6e6, heldS: 472 });
   check("savedBytes is the plain difference", Math.round(c.savedBytes), 76800000);
+}
+
+console.log("\nthe skew WARNING must actually fire (iter 53) — arithmetic is not enough");
+{
+  // Was a manual-QA box: "force a skewed run and confirm the ⚠ warning fires". The skew
+  // ARITHMETIC was already covered above, but nothing checked the harness EMITS anything — so
+  // a run with unequal arms could have published a raw subtraction in silence. A correct number
+  // that never reaches the reader is not a correct report.
+  const skewed = claimNumbers({ httpBytes: 74.8e6, heldS: 330 }, { httpBytes: 151.6e6, heldS: 472 });
+  const lines = skewWarning(skewed, 472, 330);
+  checkTrue("a 30% skew produces a warning", lines.length > 0, "silence would publish the raw figure");
+  checkTrue("it is marked with the ⚠ the operator scans for", lines.some((l) => l.includes("⚠")));
+  checkTrue("it states the skew percentage", lines.some((l) => l.includes(`${skewed.videoSkewPct}%`)));
+  checkTrue("it names BOTH figures so the gap is visible",
+    lines.some((l) => l.includes(`-${skewed.rawSavedPct}%`)) &&
+    lines.some((l) => l.includes(`-${skewed.savedPct}%`)),
+    "quoting only one number hides which was avoided");
+  checkTrue("it says which one to quote", lines.some((l) => /per-video-second/.test(l)));
+
+  // And it must stay QUIET when the arms match, or the warning becomes noise that gets ignored
+  // — which is the same failure as not warning at all.
+  const equal = claimNumbers({ httpBytes: 74.8e6, heldS: 472 }, { httpBytes: 151.6e6, heldS: 472 });
+  check("equal arms produce no warning", skewWarning(equal, 472, 472).length, 0);
+  // Just under the 3% threshold: raw and normalised are interchangeable there.
+  const tiny = claimNumbers({ httpBytes: 74.8e6, heldS: 465 }, { httpBytes: 151.6e6, heldS: 472 });
+  checkTrue("a sub-threshold skew stays quiet", skewWarning(tiny, 472, 465).length === 0,
+    `videoSkewPct=${tiny.videoSkewPct} should be <= 3`);
+  // No video at all -> videoSkewPct is null, not 0. Warning must not throw or fire on that.
+  const none = claimNumbers({ httpBytes: 74.8e6, heldS: 0 }, { httpBytes: 151.6e6, heldS: 0 });
+  check("a run with no video-seconds warns nothing (null, not 0)", skewWarning(none, 0, 0).length, 0);
 }
 
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"}: ${failures} failing assertion(s)`);
