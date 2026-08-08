@@ -58,6 +58,18 @@ const STAGGER_S = arg("stagger", 5);
 const HEADED = process.argv.includes("--headed");
 const CONTROL = process.argv.includes("--control");
 
+// --windows 6000,600,120,30 -> run once per p2pDownloadTimeWindow value and tabulate offload
+// against the viewer's bandwidth cost. `default` runs with the knob untouched as the baseline.
+const windowsArg = (() => {
+  const i = process.argv.indexOf("--windows");
+  if (i === -1) return null;
+  const raw = process.argv[i + 1];
+  if (!raw || raw.startsWith("--")) return [null, 600, 120, 30];
+  const ns = raw.split(",").map((s) => s.trim()).map((s) =>
+    s === "default" ? null : Number(s)).filter((n) => n === null || (Number.isFinite(n) && n > 0));
+  return ns.length ? ns : null;
+})();
+
 // --sweep 1,2,4,8 -> run once per count and print the offload-vs-N curve.
 const sweepArg = (() => {
   const i = process.argv.indexOf("--sweep");
@@ -124,7 +136,7 @@ async function preflight() {
 // One measured run at a given viewer count. `stopEarly` short-circuits as soon as any P2P
 // byte appears (right for a pass/fail gate, wrong for measuring a ratio). Returns a summary
 // so the sweep can tabulate; also sets process.exitCode for single-run use.
-async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER_S, stopEarly = true, p2p = true } = {}) {
+async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER_S, stopEarly = true, p2p = true, p2pWindow = null } = {}) {
   const VIEWERS = viewers;
   const WATCH_S = watchS;
   const STAGGER_S = staggerS;
@@ -133,8 +145,10 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
   // string on VIEWER_URL survives instead of being clobbered by a naive "?p2p=off".
   const url = new URL(VIEWER_URL);
   if (!p2p) url.searchParams.set("p2p", "off");
+  if (p2pWindow) url.searchParams.set("p2pWindow", String(p2pWindow));
   const pageUrl = url.toString();
-  console.log(`verify-offload: ${VIEWERS} viewers, ${WATCH_S}s watch, ${STAGGER_S}s stagger, p2p=${p2p ? "ON" : "OFF"}`);
+  console.log(`verify-offload: ${VIEWERS} viewers, ${WATCH_S}s watch, ${STAGGER_S}s stagger, p2p=${p2p ? "ON" : "OFF"}` +
+    (p2pWindow ? `, p2pWindow=${p2pWindow}s` : ""));
   console.log("preflight:");
   await preflight();
 
@@ -265,6 +279,24 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
       process.exit(2);
     }
     console.log(`  arm confirmed: p2pEnabled=${p2p} on all ${armFlags.length} viewers`);
+
+    // Read the window back OUT of the engine. A sweep whose knob silently failed would print a
+    // table of near-identical rows and read as "tuning makes no difference" — worse than no
+    // sweep, because it looks like evidence. Assert the value the engine actually holds.
+    const windows = await Promise.all(pages.map((pg) =>
+      pg.evaluate(() => (typeof window.__p2pWindow === "function" ? window.__p2pWindow() : null))));
+    const effWindow = windows[0];
+    if (p2pWindow) {
+      const wrong = windows.filter((w) => w !== p2pWindow).length;
+      if (wrong) {
+        console.error(`\nFAIL(2): asked for p2pDownloadTimeWindow=${p2pWindow} but the engine reports ${JSON.stringify(windows)}.`);
+        console.error("  The knob did not take effect, so this row would be a fabricated data point.");
+        process.exit(2);
+      }
+      console.log(`  window confirmed: p2pDownloadTimeWindow=${effWindow}s (engine-reported)`);
+    } else if (effWindow !== null && effWindow !== undefined) {
+      console.log(`  window: p2pDownloadTimeWindow=${effWindow}s (engine default, not overridden)`);
+    }
 
     console.log("watching:");
     const deadline = Date.now() + WATCH_S * 1000;
@@ -397,6 +429,9 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
       // Cost side, carried out so --control can tabulate the two arms against each other.
       p2p, stalls: totalStalls, stallS: +totalStallS.toFixed(1), avgLatency: avgLat,
       upPerViewer, ledger, heldS, bytesPerVideoS,
+      // The window the ENGINE reported, not what we asked for — so the sweep table cannot
+      // claim a value that never applied.
+      p2pWindow: effWindow,
     };
 
     // Conservation check: every byte downloaded FROM a peer was uploaded BY a peer, so in a
@@ -485,6 +520,126 @@ export function claimNumbers(on, off) {
     savedBytes: off.httpBytes - on.httpBytes,
     offOriginPerS: offPerS, onOriginPerS: onPerS,
   };
+}
+
+// --windows: sweep p2pDownloadTimeWindow and tabulate the SAVING against the viewer's COST.
+// The question this answers is not "which value gives the most offload" — it is whether the
+// 33% of never-played fetches can be cut without giving up the origin saving. So every row
+// carries both sides, and a row that wins on cost while losing the saving is not a win.
+async function runWindowSweep() {
+  console.log(`WINDOW SWEEP: p2pDownloadTimeWindow = ${windowsArg.map((w) => w ?? "default").join(", ")}` +
+    ` — ${VIEWERS} viewers, ${WATCH_S}s watch each\n`);
+
+  // A window LONGER than the stream itself cannot be distinguished from the engine default:
+  // both mean "every segment is eligible". Such rows come out byte-identical and look like a
+  // measured plateau when they are an artifact of the test material. Measured at iter 33 with a
+  // 180s stream: windows 6000 and 600 produced identical rows. Say so instead of printing them
+  // as data.
+  let streamS = null;
+  try {
+    const m = await (await fetch(PLAYLIST_URL)).text();
+    streamS = [...m.matchAll(/#EXTINF:([\d.]+)/g)].reduce((a, x) => a + Number(x[1]), 0);
+  } catch { /* preflight will report the real problem */ }
+  if (streamS) {
+    const tooBig = windowsArg.filter((w) => w !== null && w >= streamS);
+    console.log(`stream is ${streamS.toFixed(0)}s long.`);
+    if (tooBig.length) {
+      console.log(`⚠ window(s) ${tooBig.join(", ")} EXCEED the stream length, so they are`);
+      console.log(`  indistinguishable from the engine default by construction — every segment is`);
+      console.log(`  eligible either way. Treat those rows as the baseline repeated, not as data.`);
+      console.log(`  Only windows below ${streamS.toFixed(0)}s test anything on this stream.\n`);
+    }
+  }
+
+  // Measure the P2P-off baseline ONCE. Waste and KB/video-second are only meaningful against
+  // it, and re-running it per row would triple the sweep for no extra information.
+  console.log(`${"=".repeat(60)}\n=== BASELINE: P2P OFF\n${"=".repeat(60)}`);
+  const off = await runOnce({ stopEarly: false, p2p: false });
+  await sleep(3000);
+
+  const rows = [];
+  for (const w of windowsArg) {
+    console.log(`${"=".repeat(60)}\n=== p2pDownloadTimeWindow = ${w ?? "engine default"}\n${"=".repeat(60)}`);
+    const r = await runOnce({ stopEarly: false, p2p: true, p2pWindow: w });
+    if (r) rows.push(r);
+    await sleep(3000);
+  }
+
+  if (!off || !rows.length) {
+    console.error("\nFAIL(2): baseline or sweep rows missing; nothing to compare.");
+    process.exitCode = 2;
+    return;
+  }
+
+  const offKB = off.bytesPerVideoS / 1e3;
+  const wastePct = (l) => {
+    if (!l) return null;
+    const timed = l.played + l.pending + l.wasted;
+    return timed ? Math.round((l.wasted / timed) * 100) : null;
+  };
+
+  console.log(`\n${"=".repeat(72)}\nOFFLOAD vs VIEWER COST, BY P2P DOWNLOAD WINDOW\n${"=".repeat(72)}`);
+  console.log("| window |  saving | KB/video-s | amplif | wasted | stalls | peers |");
+  console.log("|--------|---------|------------|--------|--------|--------|-------|");
+  console.log(`| ${"OFF".padStart(6)} | ${"  —".padStart(7)} | ${offKB.toFixed(0).padStart(10)} |` +
+    ` ${"1.00x".padStart(6)} | ${String((wastePct(off.ledger) ?? 0) + "%").padStart(6)} |` +
+    ` ${String(off.stalls).padStart(6)} | ${String(off.peerConnects).padStart(5)} |`);
+  for (const r of rows) {
+    const c = claimNumbers(r, off);
+    const kb = r.bytesPerVideoS / 1e3;
+    console.log(`| ${String(r.p2pWindow ?? "dflt").padStart(6)} |` +
+      ` ${String((c && c.savedPct !== null ? `-${c.savedPct}%` : "n/a")).padStart(7)} |` +
+      ` ${kb.toFixed(0).padStart(10)} | ${((offKB ? kb / offKB : 0).toFixed(2) + "x").padStart(6)} |` +
+      ` ${String((wastePct(r.ledger) ?? "n/a") + "%").padStart(6)} |` +
+      ` ${String(r.stalls).padStart(6)} | ${String(r.peerConnects).padStart(5)} |`);
+  }
+
+  console.log("\ncsv:");
+  console.log("window_s,saved_pct,kb_per_video_s,amplification,wasted_pct,stalls,peer_connects");
+  for (const r of rows) {
+    const c = claimNumbers(r, off);
+    console.log(`${r.p2pWindow ?? "default"},${c && c.savedPct !== null ? c.savedPct : ""},` +
+      `${(r.bytesPerVideoS / 1e3).toFixed(0)},${(offKB ? r.bytesPerVideoS / 1e3 / offKB : 0).toFixed(2)},` +
+      `${wastePct(r.ledger) ?? ""},${r.stalls},${r.peerConnects}`);
+  }
+
+  // VERDICT. A smaller window only WINS if it cuts the viewer's cost while keeping the saving
+  // and not introducing rebuffering. Losing 10 points of saving to save 10 points of waste is
+  // not an improvement, it is a different trade — so say which it is rather than picking the
+  // prettiest number.
+  const baseline = rows.find((r) => r.p2pWindow === null || r.p2pWindow === undefined)
+    || rows.find((r) => r.p2pWindow === 6000) || rows[0];
+  const baseClaim = claimNumbers(baseline, off);
+  const baseSaved = baseClaim && baseClaim.savedPct;
+  const baseKB = baseline.bytesPerVideoS / 1e3;
+  console.log("\nverdict:");
+  console.log(`  baseline (window=${baseline.p2pWindow ?? "default"}): -${baseSaved}% saving,` +
+    ` ${baseKB.toFixed(0)} KB/video-s, ${wastePct(baseline.ledger)}% wasted, ${baseline.stalls} stalls`);
+  // "Wins" = cost strictly lower by >5%, saving within 5 points, no new stalls. Rows whose
+  // window exceeds the stream length are excluded: they are the baseline under another name and
+  // would otherwise be able to "win" against themselves on run-to-run noise.
+  const wins = rows.filter((r) => {
+    if (r === baseline) return false;
+    if (streamS && r.p2pWindow && r.p2pWindow >= streamS) return false;
+    const c = claimNumbers(r, off);
+    if (!c || c.savedPct === null || baseSaved === null) return false;
+    const kb = r.bytesPerVideoS / 1e3;
+    return kb < baseKB * 0.95 && c.savedPct >= baseSaved - 5 && r.stalls <= baseline.stalls;
+  });
+  if (wins.length) {
+    const best = wins.reduce((a, b) => (a.bytesPerVideoS <= b.bytesPerVideoS ? a : b));
+    const bc = claimNumbers(best, off);
+    const bkb = best.bytesPerVideoS / 1e3;
+    console.log(`  => window=${best.p2pWindow}s CUTS the viewer's cost ${baseKB.toFixed(0)} -> ${bkb.toFixed(0)} KB/video-s` +
+      ` (${Math.round((1 - bkb / baseKB) * 100)}% less) while holding the saving at -${bc.savedPct}% and ${best.stalls} stalls.`);
+    console.log(`     Record it in patterns.md as the recommended value, with that offload cost stated.`);
+  } else {
+    console.log(`  => NO window beats the default on cost without giving up saving or adding stalls.`);
+    console.log(`     The 1.55x is therefore NOT tunable via this knob — the read-ahead the viewer`);
+    console.log(`     pays for is what earns the offload. Record the negative result; the remedy`);
+    console.log(`     becomes bounding upload per viewer, not narrowing the window.`);
+  }
+  process.exitCode = 0;
 }
 
 async function runControl() {
@@ -676,6 +831,10 @@ const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolv
 
 (async () => {
   if (!isMain) return;
+  if (windowsArg) {
+    await runWindowSweep();
+    return;
+  }
   if (CONTROL) {
     await runControl();
     return;

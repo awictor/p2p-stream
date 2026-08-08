@@ -64,6 +64,19 @@
     // (towards measuring P2P) rather than silently reporting a control run as the real one.
     p2pEnabled: q.get("p2p") !== "off",
 
+    // ?p2pWindow=<seconds> overrides the engine's p2pDownloadTimeWindow (default 6000s — yes,
+    // seconds, ~100 minutes of read-ahead eligibility, vs 3000 for HTTP). Measured at iter 31:
+    // 33% of P2P fetches are never appended to the media buffer, so the window is the prime
+    // suspect for a viewer paying 1.55x the bytes for the same video. Null means "leave the
+    // engine default alone" — an unparseable or non-positive value must NOT silently become 0,
+    // which would disable P2P entirely and read as "the tuning killed offload".
+    p2pWindowS: (() => {
+      const raw = q.get("p2pWindow");
+      if (raw === null || raw === "") return null;
+      const n = Number(raw);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    })(),
+
     // How often each viewer reports counters to the dashboard.
     reportIntervalMs: 3000,
   };

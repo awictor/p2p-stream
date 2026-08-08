@@ -22,7 +22,8 @@
     "verify:sweep": "node test/verify-offload.js --sweep 1,2,4,8 --watch 45",
     "verify:control": "node test/verify-offload.js --control --watch 45",
     "test:ledger": "node test/ledger.test.js",
-    "test:claim": "node test/claim.test.js"
+    "test:claim": "node test/claim.test.js",
+    "verify:windows": "node test/verify-offload.js --windows default,600,120,30 --watch 40"
   },
   "dependencies": {
     "bittorrent-tracker": "^11.2.1",

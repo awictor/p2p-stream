@@ -211,6 +211,14 @@
             // through hd; the margin cannot be widened from this knob.
             // Other download-window defaults are left alone on purpose. They interact with the
             // buffer auto-tune above; hand-tuning them was part of what kept P2P off.
+            //
+            // ?p2pWindow=<s> narrows p2pDownloadTimeWindow (default 6000s). This is a DIFFERENT
+            // knob from highDemandTimeWindow above: hd decides HTTP-vs-P2P near the playhead and
+            // is coupled to buffer size, whereas p2pDownloadTimeWindow only bounds how far AHEAD
+            // a segment may be and still be P2P-eligible. Narrowing it should cut the fetches
+            // that are never played (33%, iter 31) without touching the buffer. Spread only when
+            // set, so the engine default is untouched on a normal run.
+            ...(cfg.p2pWindowS ? { p2pDownloadTimeWindow: cfg.p2pWindowS } : {}),
           },
           onHlsJsCreated(hls) {
             const eng = hls.p2pEngine;
@@ -281,6 +289,17 @@
       // Without it, a broken flag would silently produce two identical P2P-on runs and
       // the comparison would look like "P2P makes no difference".
       window.__p2pEnabled = cfg.p2pEnabled;
+      // Report the window the engine ACTUALLY applied, read back from its own config rather than
+      // echoing what we asked for. A sweep whose knob silently failed would print a table of
+      // identical rows and read as "tuning makes no difference" — the most misleading result
+      // available. Same lesson as asserting the control arm is really the control arm.
+      // Engine shape (verified in vendor source): HlsJsP2PEngine.getConfig() returns
+      // { core: {...commonCoreConfig, mainStream, secondaryStream} }.
+      window.__p2pWindow = () => {
+        try {
+          return hls.p2pEngine.getConfig().core.mainStream.p2pDownloadTimeWindow;
+        } catch { return null; }
+      };
       const videoEl = document.getElementById("video");
       // Mark segments played as the playhead moves, not only when the ledger is read. A live
       // playlist evicts old fragments, and on a long run the playhead passes segments well

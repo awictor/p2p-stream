@@ -79,7 +79,7 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 184 assertions: metrics 37, tracker 15, config 36, dashboard 24,
+npm test                  # 194 assertions: metrics 37, tracker 15, config 47, dashboard 24,
                           #                 start 16, ledger 37, claim 19
 ```
 
@@ -88,6 +88,7 @@ With the four services up:
 npm run verify            # the ONLY accepted proof of offload (~2min)
 npm run verify:sweep      # offload vs viewer count, 1/2/4/8 (~4min)
 npm run verify:control    # P2P ON vs OFF, side by side (~2min)
+npm run verify:windows    # sweep p2pDownloadTimeWindow: saving vs viewer cost (~5min)
 ```
 It drives 4 headless viewers, counts announces with/without `offers[]`, listens for the
 engine's own fault events, and prints a cause-specific diagnosis on failure. Exit codes:
@@ -155,9 +156,32 @@ double-counted accounting, **not** a duplicate fetch, and **not** HTTP racing P2
 almost exactly accounts for the 76.9MB the origin saved. The control arm's **0%** is the
 sanity check that makes the 33% believable: a pure-HTTP viewer wastes nothing.
 
-**This means the cost is tunable, not inherent.** `p2pDownloadTimeWindow` defaults to
-**6000 seconds** of read-ahead eligibility (vs 3000 for HTTP); narrowing it should cut the waste
-without touching the offload. Tracked as P2P-0029.
+### The waste is NOT tunable — read-ahead is what earns the offload (measured iter 33)
+
+The obvious fix was to narrow `p2pDownloadTimeWindow` (engine default **6000 seconds** of
+read-ahead eligibility, vs 3000 for HTTP). `npm run verify:windows` sweeps it and reports the
+saving and the viewer's cost side by side:
+
+| window | origin saving | KB/video-s | amplification | wasted |
+|---|---|---|---|---|
+| P2P off | — | 323 | 1.00x | 0% |
+| 6000 (default) | **-49%** | 519 | 1.61x | 36% |
+| 150 | -47% | 519 | 1.61x | 36% |
+| 90 | -13% | 496 | 1.54x | 33% |
+| 45 | -7% | 401 | 1.24x | 19% |
+
+**Cost and saving fall together.** Cutting the waste from 36% to 19% costs the origin saving
+49% → 7%. There is no setting that keeps the saving and drops the cost, so the read-ahead a
+viewer pays for *is* the mechanism that produces the offload — a peer can only serve a segment
+it fetched early. Zero rebuffering at every value.
+
+So the viewer's ~55% extra bandwidth is **inherent to this design, not a misconfiguration.**
+The remaining lever is consent, not tuning: let a viewer bound what they contribute (an upload
+budget or opt-out) rather than pretending the cost can be engineered away.
+
+> Windows longer than the stream itself (here 180s) are indistinguishable from the default —
+> every segment is eligible either way. The harness now says so instead of printing them as
+> data points; an earlier sweep included 6000 and 600 and produced two identical rows.
 
 So the trade is explicit: **the platform saves 51% of its origin egress, and a relaying viewer
 spends ~55% more total bandwidth** (plus ~40MB of upload each) to provide it — **and a third of

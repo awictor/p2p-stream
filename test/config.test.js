@@ -118,6 +118,25 @@ function load({ protocol = "http:", hostname = "localhost", search = "" } = {}) 
     check("same swarmId in both arms", off.swarmId, on.swarmId);
   }
 
+  console.log("\np2pWindowS: ?p2pWindow= tuning knob, must fail SAFE to the engine default:");
+  {
+    // null means "don't touch the engine default". A bad value must NOT become 0 — that would
+    // set p2pDownloadTimeWindow=0, disable P2P entirely, and read as "the tuning killed offload"
+    // rather than "the flag was malformed".
+    check("absent -> null (engine default untouched)", load().p2pWindowS, null);
+    check("?p2pWindow=120 -> 120", load({ search: "?p2pWindow=120" }).p2pWindowS, 120);
+    check("?p2pWindow=0 -> null, NOT 0", load({ search: "?p2pWindow=0" }).p2pWindowS, null);
+    check("negative -> null", load({ search: "?p2pWindow=-5" }).p2pWindowS, null);
+    check("non-numeric -> null", load({ search: "?p2pWindow=abc" }).p2pWindowS, null);
+    check("empty -> null", load({ search: "?p2pWindow=" }).p2pWindowS, null);
+    check("fractional is allowed", load({ search: "?p2pWindow=1.5" }).p2pWindowS, 1.5);
+    // The sweep compares rows against each other, so the knob must not perturb anything else.
+    const tuned = load({ search: "?p2pWindow=120" });
+    check("same streamUrl as an untuned run", tuned.streamUrl, load().streamUrl);
+    check("same swarmId as an untuned run", tuned.swarmId, load().swarmId);
+    check("P2P still enabled", tuned.p2pEnabled, true);
+  }
+
   console.log("\nICE SERVERS — regression guard on the bug that cost nine iterations:");
   {
     const c = load();
