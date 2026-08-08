@@ -12,7 +12,7 @@
     "origin:loop": "bash origin/segment.sh loop origin/sample.mp4",
     "origin:rtmp": "bash origin/segment.sh rtmp",
     "nginx": "bash origin/run-nginx.sh",
-    "test": "node test/metrics.test.js && node test/tracker.test.js && node test/config.test.js && node test/dashboard.test.js && node test/start.test.js && node test/ledger.test.js && node test/claim.test.js && node test/participation.test.js",
+    "test": "node test/metrics.test.js && node test/tracker.test.js && node test/config.test.js && node test/dashboard.test.js && node test/start.test.js && node test/ledger.test.js && node test/claim.test.js && node test/participation.test.js && node test/forgery.test.js",
     "test:metrics": "node test/metrics.test.js",
     "test:tracker": "node test/tracker.test.js",
     "test:config": "node test/config.test.js",
@@ -25,7 +25,8 @@
     "test:claim": "node test/claim.test.js",
     "verify:windows": "node test/verify-offload.js --windows default,600,120,30 --watch 40",
     "verify:participation": "node test/verify-offload.js --participation 100,75,50,25 --watch 40",
-    "test:participation": "node test/participation.test.js"
+    "test:participation": "node test/participation.test.js",
+    "test:forgery": "node test/forgery.test.js"
   },
   "dependencies": {
     "bittorrent-tracker": "^11.2.1",

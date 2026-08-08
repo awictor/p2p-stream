@@ -80,8 +80,8 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 257 assertions: metrics 55, tracker 15, config 57, dashboard 24, start 16,
-                          #                 ledger 37, claim 19, participation 35
+npm test                  # 286 assertions: metrics 55, tracker 15, config 57, dashboard 24, start 16,
+                          #                 ledger 37, claim 19, participation 35, forgery 29
 ```
 
 With the four services up:
@@ -223,6 +223,29 @@ lets a viewer self-credit 501,000 bytes).
 > `peerId → clientId` mapping is self-declared. Treat attested totals as a **cross-check**, not an
 > authorisation to pay. Closing the collusion gap needs authenticated peer identity at the tracker,
 > which this MVP does not have.
+
+**`npm run verify` now prints the two side by side, per viewer.** An honest 4-viewer run:
+
+```
+upload claims vs receiver attestations (the forgery signal):
+  7e257ac3  claimed   15.5MB  attested   13.5MB  attested/claimed=0.87  ok
+  702283ae  claimed   26.6MB  attested   25.3MB  attested/claimed=0.95  ok
+  50f0d103  claimed   34.9MB  attested   36.2MB  attested/claimed=1.04  ok
+  48cd9bb5  claimed   32.4MB  attested   35.6MB  attested/claimed=1.10  ok
+  => no viewer over-claims by >25%; self-reported and attested agree within normal report timing.
+```
+
+**The threshold: distrust a claim when `attested/claimed < 0.75`.** Honest runs land between 0.87
+and 1.10, so a 25% tolerance leaves real headroom for report timing while still catching a peer
+that claims bytes nobody received. Two deliberate asymmetries:
+
+- **Only over-claiming is flagged.** `attested > claimed` means receivers saw more than the peer
+  admits — no payout risk, so it's reported and not alarmed.
+- **Claims under 1MB are not judged.** A viewer that has served three segments can read 0.5 purely
+  from report timing; judging those would raise an alarm on every startup.
+
+Per-viewer matters more than the swarm total: one peer inflating its claim while three report
+honestly barely moves the aggregate, but stands out immediately per client.
 
 > Windows longer than the stream itself (here 180s) are indistinguishable from the default —
 > every segment is eligible either way. The harness now says so instead of printing them as

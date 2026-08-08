@@ -469,6 +469,29 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
                    : skew > 25 ? "  <-- check for viewers leaving mid-run" : "  ok"));
     }
 
+    // FORGERY SIGNAL, per viewer. Conservation above is swarm-wide and so hides a single liar:
+    // one peer inflating its claim while three report honestly barely moves the sum. This diffs
+    // each viewer's own claim against what its RECEIVERS attested, which is the only comparison
+    // a reward tier could act on.
+    const sig = forgerySignals(final.uploadByClient, final.attestedByClient);
+    if (sig.rows.length) {
+      console.log("\nupload claims vs receiver attestations (the forgery signal):");
+      for (const r of sig.rows) {
+        const pct = r.ratio === null ? "n/a" : r.ratio === Infinity ? "inf" : r.ratio.toFixed(2);
+        console.log(`  ${r.id.slice(0, 8)}  claimed ${mb(r.self).padStart(8)}  attested ${mb(r.attested).padStart(8)}` +
+          `  attested/claimed=${pct}` +
+          (!r.judged ? "  (too small to judge)"
+            : r.overClaim ? "  <-- OVER-CLAIMING: bytes nobody received"
+              : r.underClaim ? "  (under-claims; not a payout risk)" : "  ok"));
+      }
+      if (sig.unmapped > 0) {
+        console.log(`  ${mb(sig.unmapped)} attested to peerIds with no known client (departed or unannounced).`);
+      }
+      console.log(sig.suspects.length
+        ? `  => ${sig.suspects.length} viewer(s) claim materially more than receivers confirm. DO NOT pay out on self-reported upload.`
+        : `  => no viewer over-claims by >25%; self-reported and attested agree within normal report timing.`);
+    }
+
     // The control arm is EXPECTED to show no P2P bytes, so the pass/fail verdict below
     // would be exactly inverted for it. --control judges it itself (0% is the sanity check
     // that the flag worked); here we just report and leave the exit code alone.
@@ -567,6 +590,42 @@ export function participationPlan({ viewers, relayers = null, p2p = true, p2pWin
 // the same amount of video; when they differ, the raw formula credits P2P for video the control
 // arm played and the P2P arm did not. At iter 25/29/31 the arms happened to match (472s vs 472s)
 // so the raw number was right by luck. Per video-second is right by construction.
+// FORGERY SIGNAL. Diffs what each viewer CLAIMS it uploaded against what its receivers say it
+// served them. Pure, so the threshold that decides "distrust this claim" is unit-testable rather
+// than buried in the driver — the same reason claimNumbers() was extracted.
+//
+// Direction matters and is the whole point:
+//   self >> attested  -> the peer claims bytes nobody received. That is the forgery a reward tier
+//                        would pay out on, so it is the flagged case.
+//   attested >> self   -> receivers report MORE than the server admits. Not a payout risk (it
+//                        under-claims), usually just report timing, so it is reported not flagged.
+// Honest runs measured 0.97-1.03, so a wide band is normal and only a gross gap is a signal.
+export function forgerySignals(uploadByClient = {}, attestedByClient = {}, { tolerance = 0.25, floorBytes = 1e6 } = {}) {
+  const ids = new Set([...Object.keys(uploadByClient), ...Object.keys(attestedByClient)]);
+  const rows = [];
+  for (const id of ids) {
+    if (id.startsWith("unmapped:")) continue;   // no client to judge; reported separately
+    const self = Number(uploadByClient[id]) || 0;
+    const attested = Number(attestedByClient[id]) || 0;
+    // Below the floor, ratios are noise: a viewer that has served 3 segments can read 0.5 purely
+    // from report timing. Judging those would manufacture alarms on every startup.
+    const judged = self >= floorBytes || attested >= floorBytes;
+    const ratio = self > 0 ? attested / self : (attested > 0 ? Infinity : null);
+    // Flag ONLY over-claiming, and only once the numbers are big enough to mean something.
+    const overClaim = judged && self > 0 && ratio !== null && ratio < 1 - tolerance;
+    const underClaim = judged && ratio !== null && ratio > 1 + tolerance;
+    rows.push({ id, self, attested, ratio, judged, overClaim, underClaim });
+  }
+  rows.sort((a, b) => (a.ratio ?? 9e9) - (b.ratio ?? 9e9));
+  return {
+    rows,
+    suspects: rows.filter((r) => r.overClaim),
+    unmapped: Object.entries(attestedByClient)
+      .filter(([k]) => k.startsWith("unmapped:"))
+      .reduce((a, [, v]) => a + (Number(v) || 0), 0),
+  };
+}
+
 export function claimNumbers(on, off) {
   if (!on || !off) return null;
   const originPerS = (a) => (a.heldS > 0 ? a.httpBytes / a.heldS : null);

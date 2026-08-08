@@ -167,6 +167,10 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
       attestedUploadBytes: attestedTotal,
       attestedByClient,
       attestingClients: attestations.size,
+      // Per-client SELF-REPORTED upload, so the two views can be diffed per viewer rather than
+      // only in aggregate. A swarm-level total hides a single liar: one peer inflating its claim
+      // while three report honestly barely moves the sum, but stands out per client.
+      uploadByClient: Object.fromEntries([...clients].map(([id, c]) => [id, c.uploadBytes])),
       // Exposed so the bound is OBSERVABLE. An unbounded Map with no counter stays invisible
       // until it is a production problem; `tracked` earned its place the same way.
       trackedPeerIds: peerToClient.size,
