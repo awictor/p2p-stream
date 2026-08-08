@@ -80,8 +80,8 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 406 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
-                          #                 ledger 37, claim 19, participation 35, forgery 29, sybil 29
+npm test                  # 448 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
+                          #                 ledger 37, claim 19, participation 35, forgery 29, sybil 29, origin 42
 ```
 
 With the four services up:
@@ -162,6 +162,26 @@ runs the identical scenario twice — once normally, once with `?p2p=off` — an
 
 Origin egress fell by **51%**, not 68%, because the P2P arm fetched *more total bytes*. **Quote the
 control-arm subtraction, not the offload ratio.** The ratio is the flattering number.
+
+#### A second, independent instrument — and it measures a *different* quantity (iter 52)
+
+Every number above is counted **by the browser about itself**. nginx also logs `$body_bytes_sent`
+per request, which is server-side and owes the page no trust, so `npm run test:origin` reads it as a
+cross-check. On a 4-viewer control run nginx counted **97.7MB** where the harness reported
+**219.9MB** of origin bytes. That is not an accounting bug in either — **190 of 340 segment
+requests came back `304 Not Modified`**, so the browser's cache served them and nginx sent no body
+at all, while hls.js still reports the segment as loaded from HTTP.
+
+So the two figures answer different questions, and a claim has to say which:
+
+| instrument | what it counts | 4-viewer control run |
+|---|---|---|
+| harness (browser) | bytes the viewer **obtained** from origin, cache hits included | 219.9MB |
+| nginx `$body_bytes_sent` | bytes the CDN actually **paid to send** | 97.7MB |
+
+The published **-51% / -49% is a ratio between two arms measured with the same instrument**, so it
+stands — both arms count cache hits the same way. But an absolute "the origin served N MB" should
+come from the nginx log, not the page. The gap is real caching, which a CDN bill would also see.
 
 That 51% is measured **per video-second** (320 → 158 KB per second of video obtained), not as a raw
 byte subtraction. The distinction only matters when the two arms play unequal amounts of video —
