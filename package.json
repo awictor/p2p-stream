@@ -16,7 +16,8 @@
     "test:config": "node test/config.test.js",
     "test:dashboard": "node test/dashboard.test.js",
     "verify": "node test/verify-offload.js",
-    "verify:sweep": "node test/verify-offload.js --sweep 1,2,4,8 --watch 45"
+    "verify:sweep": "node test/verify-offload.js --sweep 1,2,4,8 --watch 45",
+    "verify:control": "node test/verify-offload.js --control --watch 45"
   },
   "dependencies": {
     "bittorrent-tracker": "^11.2.1",

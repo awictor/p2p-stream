@@ -5,6 +5,8 @@ and peers fan out the rest, cutting the egress bill that dominates streaming cos
 Live, browser-only, and it **measures the ratio** (% bytes served peer-to-peer vs origin).
 
 > **Status: working, and offload rises with swarm size — 45% at 2 viewers, 79% at 8.**
+> Measured against a P2P-off control arm, origin egress falls **51%** at 4 viewers with zero
+> rebuffering. (Offload ratio ≠ bill reduction — see below.)
 > Measured by `npm run verify:sweep` on one machine. Not yet reproduced across two machines.
 > See [Status](#-status-working--offload-rises-with-swarm-size).
 
@@ -73,6 +75,7 @@ With the four services up:
 ```bash
 npm run verify            # the ONLY accepted proof of offload (~2min)
 npm run verify:sweep      # offload vs viewer count, 1/2/4/8 (~4min)
+npm run verify:control    # P2P ON vs OFF, side by side (~2min)
 ```
 It drives 4 headless viewers, counts announces with/without `offers[]`, listens for the
 engine's own fault events, and prints a cause-specific diagnosis on failure. Exit codes:
@@ -93,9 +96,29 @@ to pull from, so offload climbs — which is the whole economic argument:
 | 4 | 67% | 236.5MB | 114.7MB | 12 |
 | 8 | **79%** | 585.8MB | 158.3MB | 50 |
 
-At 8 concurrent viewers the origin served 79% less. `N=1` at 0% is correct — a lone viewer has
-no peer to pull from — and peer connections growing 2→12→50 is the mesh fanning out rather than
-a star. `N=2` measured 45% and 44% on independent runs.
+`N=1` at 0% is correct — a lone viewer has no peer to pull from — and peer connections growing
+2→12→50 is the mesh fanning out rather than a star. `N=2` measured 45% and 44% on independent runs.
+
+### ⚠️ The offload ratio is NOT the bill reduction (measured iter 25)
+
+The percentages above are the **share of delivered bytes that came from peers**. That is not the
+same as how much less the origin served, and the difference is not small. `npm run verify:control`
+runs the identical scenario twice — once normally, once with `?p2p=off` — and compares them:
+
+| metric | P2P ON | P2P OFF |
+|---|---|---|
+| offload ratio | 68% | 0% |
+| **origin bytes** | **74.8MB** | **151.6MB** |
+| total fetched | 234.4MB | 151.6MB |
+| stalls | 0 | 0 |
+
+Origin egress fell by **51%**, not 68%, because the P2P arm fetched *more total bytes* — the
+engine prefetches aggressively over P2P (`p2pDownloadTimeWindow` is 6000s). **Quote the
+control-arm subtraction, not the offload ratio.** The ratio is the flattering number.
+
+The control arm also settles what the QoE figures mean: **both arms rebuffered zero times**, so
+the correct claim is "P2P cut origin bytes with no rebuffering introduced" — *not* that P2P
+improved playback. Playback was already clean without it.
 
 **Upload accounting cross-checks.** Every byte downloaded from a peer must have been uploaded by
 one, and it balances: 171.6MB down vs 172.6MB up in a 4-viewer run (0.6% skew). The harness now

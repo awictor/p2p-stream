@@ -16,6 +16,14 @@
  * Usage:
  *   node test/verify-offload.js [--viewers 4] [--watch 90] [--stagger 5] [--headed]
  *   node test/verify-offload.js --sweep 1,2,4,8 [--watch 45]
+ *   node test/verify-offload.js --control [--watch 45]
+ *
+ * --control runs the SAME scenario twice — once with P2P on, once with `?p2p=off` — and
+ * prints the two arms side by side. This exists because a QoE number with no baseline is
+ * an anecdote: "0 stalls with P2P" only means something if we know what this stack does
+ * WITHOUT P2P. The off arm doubles as a check that the flag really disables P2P; if it
+ * still shows offload, the comparison is meaningless and the run fails loudly (exit 2)
+ * rather than quietly reporting two identical P2P-on runs as a comparison.
  *
  * --sweep runs the harness once per viewer count and prints a N -> offload% table, which
  * is the economic claim (offload should RISE with swarm size). Two differences from a
@@ -48,6 +56,7 @@ const VIEWERS = arg("viewers", 4);
 const WATCH_S = arg("watch", 90);
 const STAGGER_S = arg("stagger", 5);
 const HEADED = process.argv.includes("--headed");
+const CONTROL = process.argv.includes("--control");
 
 // --sweep 1,2,4,8 -> run once per count and print the offload-vs-N curve.
 const sweepArg = (() => {
@@ -113,11 +122,17 @@ async function preflight() {
 // One measured run at a given viewer count. `stopEarly` short-circuits as soon as any P2P
 // byte appears (right for a pass/fail gate, wrong for measuring a ratio). Returns a summary
 // so the sweep can tabulate; also sets process.exitCode for single-run use.
-async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER_S, stopEarly = true } = {}) {
+async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER_S, stopEarly = true, p2p = true } = {}) {
   const VIEWERS = viewers;
   const WATCH_S = watchS;
   const STAGGER_S = staggerS;
-  console.log(`verify-offload: ${VIEWERS} viewers, ${WATCH_S}s watch, ${STAGGER_S}s stagger`);
+  // The control arm is the same page with one query param, so both arms exercise the same
+  // player, the same origin and the same metrics path. Built via URL so an existing query
+  // string on VIEWER_URL survives instead of being clobbered by a naive "?p2p=off".
+  const url = new URL(VIEWER_URL);
+  if (!p2p) url.searchParams.set("p2p", "off");
+  const pageUrl = url.toString();
+  console.log(`verify-offload: ${VIEWERS} viewers, ${WATCH_S}s watch, ${STAGGER_S}s stagger, p2p=${p2p ? "ON" : "OFF"}`);
   console.log("preflight:");
   await preflight();
 
@@ -174,7 +189,7 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
           console.log(`  [tab${i}] ${t}`);
         }
       });
-      await page.goto(VIEWER_URL, { waitUntil: "domcontentloaded" });
+      await page.goto(pageUrl, { waitUntil: "domcontentloaded" });
       // Hook the engine directly so a P2P segment is impossible to miss or fake.
       await page.evaluate(() => {
         // QoE (cost side): a savings figure means nothing without what the viewer paid.
@@ -236,6 +251,18 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
       process.exit(2);
     }
     console.log(`  playback confirmed on ${playing.filter(Boolean).length}/${VIEWERS} viewers`);
+
+    // Assert the arm is the arm we asked for. A control run that silently left P2P on
+    // would produce a meaningless comparison that still LOOKS like a comparison, which is
+    // worse than no baseline at all.
+    const armFlags = await Promise.all(pages.map((p) => p.evaluate(() => window.__p2pEnabled)));
+    const wrongArm = armFlags.filter((f) => f !== p2p).length;
+    if (wrongArm) {
+      console.error(`\nFAIL(2): ${wrongArm}/${armFlags.length} viewers reported p2pEnabled=${armFlags[0]}, expected ${p2p}.`);
+      console.error("  The ?p2p=off flag did not take effect, so this arm is not what it claims.");
+      process.exit(2);
+    }
+    console.log(`  arm confirmed: p2pEnabled=${p2p} on all ${armFlags.length} viewers`);
 
     console.log("watching:");
     const deadline = Date.now() + WATCH_S * 1000;
@@ -308,6 +335,9 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
     summary = {
       viewers: VIEWERS, offloadPct: dPct, p2pBytes: dP2p, httpBytes: dHttp, uploadBytes: dUp,
       p2pSegments, peerConnects, pass: dP2p > 0 && p2pSegments > 0,
+      // Cost side, carried out so --control can tabulate the two arms against each other.
+      p2p, stalls: totalStalls, stallS: +totalStallS.toFixed(1), avgLatency: avgLat,
+      upPerViewer,
     };
 
     // Conservation check: every byte downloaded FROM a peer was uploaded BY a peer, so in a
@@ -323,7 +353,12 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
                    : skew > 25 ? "  <-- check for viewers leaving mid-run" : "  ok"));
     }
 
-    if (final.p2pBytes > 0 && p2pSegments > 0) {
+    // The control arm is EXPECTED to show no P2P bytes, so the pass/fail verdict below
+    // would be exactly inverted for it. --control judges it itself (0% is the sanity check
+    // that the flag worked); here we just report and leave the exit code alone.
+    if (!p2p) {
+      console.log(`\ncontrol arm (p2p=off): ${dPct}% offload, ${p2pSegments} p2p segments — 0 is the expected result.`);
+    } else if (final.p2pBytes > 0 && p2pSegments > 0) {
       console.log("\nPASS: real peer-to-peer bytes observed.");
       process.exitCode = 0;
     } else {
@@ -357,7 +392,106 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
   return summary;
 }
 
+// --control: same scenario, P2P on vs P2P off, printed side by side. Both arms burn the
+// full watch window (stopEarly:false) or the on arm would exit at its first P2P byte and
+// the two arms would cover different amounts of playback, making every column
+// incomparable.
+async function runControl() {
+  console.log(`CONTROL: ${VIEWERS} viewers, ${WATCH_S}s watch — P2P ON vs P2P OFF\n`);
+  console.log(`${"=".repeat(60)}\n=== ARM 1/2: P2P ON\n${"=".repeat(60)}`);
+  const on = await runOnce({ stopEarly: false, p2p: true });
+  await sleep(3000); // let the previous arm's viewers age out of the active count
+  console.log(`\n${"=".repeat(60)}\n=== ARM 2/2: P2P OFF (control)\n${"=".repeat(60)}`);
+  const off = await runOnce({ stopEarly: false, p2p: false });
+
+  if (!on || !off) {
+    console.error("\nFAIL(2): an arm did not complete; nothing to compare.");
+    process.exit(2);
+  }
+
+  const row = (label, a, b) => console.log(`| ${label.padEnd(20)} | ${String(a).padStart(12)} | ${String(b).padStart(12)} |`);
+  console.log(`\n${"=".repeat(60)}\nP2P ON vs OFF\n${"=".repeat(60)}`);
+  console.log(`| ${"metric".padEnd(20)} | ${"P2P ON".padStart(12)} | ${"P2P OFF".padStart(12)} |`);
+  console.log(`|${"-".repeat(22)}|${"-".repeat(14)}|${"-".repeat(14)}|`);
+  row("offload", on.offloadPct + "%", off.offloadPct + "%");
+  row("origin bytes", mb(on.httpBytes), mb(off.httpBytes));
+  row("p2p bytes", mb(on.p2pBytes), mb(off.p2pBytes));
+  // Total fetched is NOT the same across arms and hiding that would flatter P2P: the engine
+  // prefetches aggressively over P2P (p2pDownloadTimeWindow is 6000s), so the swarm pulls
+  // more total data than the HTTP-only arm. Origin egress still falls, which is the bill
+  // that matters — but "total bytes moved" goes UP, and a reader deserves to see it.
+  row("total fetched", mb(on.httpBytes + on.p2pBytes), mb(off.httpBytes + off.p2pBytes));
+  row("upload/viewer", mb(on.upPerViewer), mb(off.upPerViewer));
+  row("stalls", `${on.stalls} (${on.stallS}s)`, `${off.stalls} (${off.stallS}s)`);
+  row("avg latency", on.avgLatency + "s", off.avgLatency + "s");
+  row("peer connects", on.peerConnects, off.peerConnects);
+
+  // The whole point of the control arm: attribute (or refuse to attribute) the QoE result.
+  const dStalls = on.stalls - off.stalls;
+  // Quote the MEASURED origin reduction, not the offload ratio — they are different numbers
+  // and the ratio is the larger, flattering one (see the note below the table).
+  const savedPctForClaim = off.httpBytes > 0
+    ? Math.round(((off.httpBytes - on.httpBytes) / off.httpBytes) * 100) : null;
+  console.log("\ninterpretation:");
+  if (on.stalls === 0 && off.stalls === 0) {
+    console.log(`  Both arms rebuffered ZERO times, so the zero-stall result is NOT attributable`);
+    console.log(`  to P2P — it is how this stack plays video here. The honest claim is`);
+    console.log(`  "P2P cut origin bytes by ${savedPctForClaim ?? "?"}% without introducing rebuffering",`);
+    console.log(`  NOT "P2P improved playback". Playback was already clean.`);
+  } else if (dStalls > 0) {
+    console.log(`  P2P rebuffered ${dStalls} MORE time(s) than the control — offload is costing`);
+    console.log(`  playback quality. Report this WITH the ${on.offloadPct}% figure, never without.`);
+  } else {
+    console.log(`  P2P rebuffered ${-dStalls} FEWER time(s) than the control. Suggestive, but one`);
+    console.log(`  run each is not a trend — repeat before claiming P2P improves playback.`);
+  }
+  // The headline economic claim: the control arm's origin bytes are the bill WITHOUT P2P,
+  // so this subtraction is the only direct measurement of what a platform stops paying for.
+  const savedBytes = off.httpBytes - on.httpBytes;
+  if (off.httpBytes === 0) {
+    console.log(`  origin comparison UNAVAILABLE: the control arm counted 0 bytes (see FAIL below).`);
+  } else if (savedBytes > 0) {
+    const savedPct = Math.round((savedBytes / off.httpBytes) * 100);
+    console.log(`  origin served ${mb(savedBytes)} less with P2P on (${mb(off.httpBytes)} -> ${mb(on.httpBytes)}, -${savedPct}%).`);
+    console.log(`  That subtraction — not the offload ratio — is the bill a platform stops paying.`);
+    if (savedPct < on.offloadPct) {
+      console.log(`  NOTE: the real saving (-${savedPct}%) is SMALLER than the ${on.offloadPct}% offload ratio,`);
+      console.log(`  because the P2P arm fetched more total bytes (prefetch). Quote -${savedPct}%, not ${on.offloadPct}%.`);
+    }
+  } else {
+    console.log(`  origin served MORE with P2P on (${mb(off.httpBytes)} -> ${mb(on.httpBytes)}); no saving measured.`);
+  }
+
+  // Verdict. The off arm showing offload means the flag did not work, which invalidates the
+  // comparison — that is a harness failure (2), not a product failure (1).
+  //
+  // The off arm must also have COUNTED its bytes. Measured at iter 25: with isP2PDisabled the
+  // engine delegates to hls.js's default loader and onSegmentLoaded never fires, so the arm
+  // reported 0 MB origin bytes — which reads as "P2P off is free" when it is the expensive
+  // arm. A control arm that measures nothing is worse than no control arm, because it still
+  // prints a table.
+  if (off.httpBytes === 0) {
+    console.log(`\nFAIL(2): control arm reported 0 origin bytes — it fetched video but counted none.`);
+    console.log("  The P2P-off byte accounting is blind (see the FRAG_LOADED path in index.html).");
+    process.exitCode = 2;
+  } else if (off.p2pBytes > 0 || off.p2pSegments > 0) {
+    console.log(`\nFAIL(2): control arm still moved P2P bytes (${mb(off.p2pBytes)}, ${off.p2pSegments} segs).`);
+    console.log("  ?p2p=off did not disable P2P, so the two arms are not a comparison.");
+    process.exitCode = 2;
+  } else if (!on.pass) {
+    console.log("\nFAIL(1): the P2P arm produced no P2P bytes, so there is nothing to compare.");
+    process.exitCode = 1;
+  } else {
+    console.log("\nPASS: P2P arm offloaded, control arm did not — the comparison is valid.");
+    process.exitCode = 0;
+  }
+}
+
 (async () => {
+  if (CONTROL) {
+    await runControl();
+    return;
+  }
   if (!sweepArg) {
     await runOnce();
     return;

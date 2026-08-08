@@ -57,6 +57,13 @@
     // DIFFERENT machines must use the same value or they form separate swarms.
     swarmId: q.get("swarm") || "p2p-stream-demo-1",
 
+    // ?p2p=off turns this viewer into a pure-HTTP control arm. The harness needs it to
+    // answer "was playback actually better WITH P2P?" — a QoE number with no baseline is
+    // an anecdote, since zero stalls might just be how this stack always plays video.
+    // Anything other than the exact string "off" leaves P2P ON, so a typo fails SAFE
+    // (towards measuring P2P) rather than silently reporting a control run as the real one.
+    p2pEnabled: q.get("p2p") !== "off",
+
     // How often each viewer reports counters to the dashboard.
     reportIntervalMs: 3000,
   };

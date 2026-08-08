@@ -109,6 +109,17 @@
             swarmId: cfg.swarmId,
             announceTrackers: cfg.announceTrackers,
             rtcConfig: { iceServers: cfg.iceServers },
+            // CONTROL ARM (?p2p=off). Both keys are top-level baseConfig keys that the
+            // engine merges into mainStreamConfig/secondaryStreamConfig, so setting them
+            // here covers both streams:
+            //   isP2PDisabled       -> isSegmentLoadable() returns false, so every segment
+            //                          is fetched over HTTP
+            //   isP2PUploadDisabled -> we serve nothing to peers either
+            // The engine is deliberately still INSTANTIATED and still announces; only P2P
+            // transfer is off. That keeps the control arm the same code path with one
+            // variable flipped, instead of comparing against a different player entirely.
+            isP2PDisabled: !cfg.p2pEnabled,
+            isP2PUploadDisabled: !cfg.p2pEnabled,
             // DO NOT lower highDemandTimeWindow to widen the P2P margin — measured dead at
             // iter 3. The buffer is sized FROM it (maxBufferLength auto-tune = max(2*td, hd)),
             // so lowering hd lowers the buffer by the same amount and the P2P-eligible slice
@@ -127,6 +138,21 @@
               else httpBytes += len; // "http" (origin) or anything non-p2p
               paint();
             });
+            // CONTROL ARM ACCOUNTING. With isP2PDisabled the engine's loader checks
+            // isSegmentLoadable(), sees false, delegates to hls.js's DEFAULT loader and
+            // returns early — so loadSegment() never runs and onSegmentLoaded NEVER FIRES.
+            // The handler above therefore counts nothing, and the control arm reported
+            // "0 MB origin bytes", which is blindness masquerading as a measurement: it made
+            // P2P-off look free when it is the expensive arm. hls.js's own FRAG_LOADED fires
+            // whichever loader ran, so use it when P2P is off. Only ONE of the two paths is
+            // ever active, so there is no double counting.
+            if (!cfg.p2pEnabled) {
+              hls.on(window.Hls.Events.FRAG_LOADED, (_e, d) => {
+                httpBytes += (d && d.frag && d.frag.stats && d.frag.stats.total)
+                  || (d && d.payload && d.payload.byteLength) || 0;
+                paint();
+              });
+            }
             // Bytes WE served to other peers (our contribution to offloading origin).
             // There is NO "onSegmentUploaded" event — upload is reported per CHUNK, and the
             // handler receives POSITIONAL args, not an object:
@@ -148,6 +174,10 @@
       });
 
       window.__hls = hls; // expose for debugging/inspection
+      // The harness reads this to assert the control arm really is the arm it asked for.
+      // Without it, a broken flag would silently produce two identical P2P-on runs and
+      // the comparison would look like "P2P makes no difference".
+      window.__p2pEnabled = cfg.p2pEnabled;
       hls.attachMedia(document.getElementById("video"));
       hls.loadSource(cfg.streamUrl);
     } else {

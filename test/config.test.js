@@ -98,6 +98,26 @@ function load({ protocol = "http:", hostname = "localhost", search = "" } = {}) 
     check("override", load({ search: "?swarm=my-swarm" }).swarmId, "my-swarm");
   }
 
+  console.log("\np2pEnabled: ?p2p=off is the harness control arm, and must FAIL SAFE:");
+  {
+    // Default and any non-"off" value must leave P2P ON. If a typo silently disabled P2P,
+    // a normal verify run would report 0% offload and look like a product regression; and
+    // the control arm would stop being a control. Only the exact string "off" disables.
+    check("default is enabled", load().p2pEnabled, true);
+    check("?p2p=off disables", load({ search: "?p2p=off" }).p2pEnabled, false);
+    check("?p2p=on enables", load({ search: "?p2p=on" }).p2pEnabled, true);
+    check("?p2p=OFF is NOT off (exact match only)", load({ search: "?p2p=OFF" }).p2pEnabled, true);
+    check("?p2p= (empty) stays enabled", load({ search: "?p2p=" }).p2pEnabled, true);
+    check("?p2p=false stays enabled", load({ search: "?p2p=false" }).p2pEnabled, true);
+    // The flag must not disturb anything else — the control arm has to hit the same origin,
+    // tracker and swarm as the real arm, or the two runs are not comparable.
+    const off = load({ search: "?p2p=off" });
+    const on = load();
+    check("same streamUrl in both arms", off.streamUrl, on.streamUrl);
+    check("same tracker in both arms", off.announceTrackers[0], on.announceTrackers[0]);
+    check("same swarmId in both arms", off.swarmId, on.swarmId);
+  }
+
   console.log("\nICE SERVERS — regression guard on the bug that cost nine iterations:");
   {
     const c = load();
