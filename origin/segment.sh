@@ -14,6 +14,17 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="$(cd "$(dirname "$0")" && pwd)/hls"
 mkdir -p "$OUT_DIR"
 
+# START FROM A CLEAN DIRECTORY. ffmpeg overwrites seg_00000..N but never removes segments
+# NUMBERED ABOVE what this run produces, and `vod` mode has no `delete_segments` at all. So a
+# short run after a longer one leaves orphans: measured 99 files on disk against a 15-entry
+# playlist — 84 stale segments.
+#
+# The playlist itself stays correct, so playback is unaffected. The damage is to MEASUREMENT:
+# `ls origin/hls/*.m4s | wc -l` is the obvious way to check "is the origin ready yet", and it
+# silently reads the orphans as progress. That is how a failure-path test once passed on stale
+# fragments from a previous run. Delete segments + playlist, keep the directory.
+rm -f "$OUT_DIR"/*.m4s "$OUT_DIR"/*.m3u8 "$OUT_DIR"/init.mp4 2>/dev/null || true
+
 # Prefer local portable ffmpeg (bin/), else fall back to PATH.
 FFMPEG="${FFMPEG:-$ROOT/bin/ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe}"
 [ -x "$FFMPEG" ] || FFMPEG="ffmpeg"
