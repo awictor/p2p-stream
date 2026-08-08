@@ -80,7 +80,7 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 338 assertions: metrics 55, tracker 30, config 57, dashboard 24, start 24,
+npm test                  # 353 assertions: metrics 70, tracker 30, config 57, dashboard 24, start 24,
                           #                 ledger 37, claim 19, participation 35, forgery 29, sybil 29
 ```
 
@@ -272,9 +272,29 @@ which changes the signaling contract and this MVP does not have.
 
 > **So: no reward tier can pay out on these numbers.** Receiver attestation raises the bar from
 > "edit one integer" to "run N tabs", and the detector catches a lone liar — both real improvements,
-> neither sufficient. A cheaper partial mitigation (require credit from ≥K distinct attesters *and*
-> cap per-attester vouching) is tracked as P2P-0038; note that a bare K-distinct rule is defeated
-> for free by making the ring bigger, which is why the cap matters.
+> neither sufficient.
+
+### K-of-N filter: meter the attack you cannot stop (iter 46)
+
+`/stats` now reports credit **twice** — raw, and filtered so it only counts when at least **K=2
+distinct attesters** vouch, with no single attester contributing more than **20MB** of one peer's
+credit. Both are reported because the *gap* is the signal.
+
+| scenario | raw credit | filtered | what it shows |
+|---|---|---|---|
+| honest 4-viewer run | 154.2MB | **154.2MB (100%)** | real usage is not punished |
+| one voucher claiming 30MB | 30MB | **0** | a lone witness is not evidence |
+| two vouchers × 30MB | 60MB | 40MB | the per-attester cap bites |
+| 4-identity ring × 50MB each | 150MB | **60MB (−60%)** | metered, not stopped |
+
+**The cap is the half that matters.** A bare "≥K distinct attesters" rule is defeated *for free* by
+enlarging the ring — every member of a K+1 ring already has K attesters. Capping per-attester
+vouching means each fake identity must carry real traffic to be worth anything, so the attacker's
+cost scales with the credit claimed instead of being flat.
+
+> **⚠ This meters collusion; it does not stop it, and the ring still earns 60MB.** A 2-member ring
+> remains byte-identical to two honest peers, so no filter can separate them. Still not an
+> authorisation to pay. Tune with `MIN_ATTESTERS` / `MAX_VOUCH_PER_ATTESTER`.
 
 > Windows longer than the stream itself (here 180s) are indistinguishable from the default —
 > every segment is eligible either way. The harness now says so instead of printing them as

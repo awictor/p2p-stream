@@ -31,6 +31,14 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   // so a later report updates in place instead of double-counting.
   const EVICT_MS = STALE_MS * 20; // 5 minutes
 
+  // K-of-N attestation filter (see the aggregation below). Overridable so a deployment can tighten
+  // it and so tests can pin behaviour at both sides of the boundary.
+  // MIN_ATTESTERS=2 is the weakest useful setting: it kills a lone forged voucher while still
+  // crediting an honest pair. MAX_VOUCH_PER_ATTESTER caps how much ONE receiver can be worth, which
+  // is what makes a bigger ring cost more rather than nothing.
+  const MIN_ATTESTERS = Number(process.env.MIN_ATTESTERS || 2);
+  const MAX_VOUCH_PER_ATTESTER = Number(process.env.MAX_VOUCH_PER_ATTESTER || 20e6); // 20MB
+
   // Evicted clients' counters are FOLDED IN HERE rather than discarded. Reports are
   // cumulative snapshots, so deleting an entry would subtract bytes that really were
   // served and make offloadRatio jump backwards — which would also break the sweep's
@@ -142,6 +150,9 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
     // detect, so it is dropped rather than counted.
     const attestedByClient = {};
     let attestedTotal = retired.attestedUploadBytes;
+    // Who vouched for whom, and how much each one vouched. Needed for the K-of-N filter below:
+    // a raw sum cannot tell "20 receivers each saw 1MB" from "one receiver claims 20MB".
+    const vouchers = new Map();   // creditedKey -> Map(attesterId -> bytes)
     for (const [attestingId, a] of attestations) {
       for (const [pid, bytes] of Object.entries(a.byPeer)) {
         const m = peerToClient.get(pid);
@@ -150,7 +161,34 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
         attestedTotal += bytes;
         const key = servedBy || `unmapped:${pid}`;
         attestedByClient[key] = (attestedByClient[key] || 0) + bytes;
+        if (!vouchers.has(key)) vouchers.set(key, new Map());
+        const v = vouchers.get(key);
+        v.set(attestingId, (v.get(attestingId) || 0) + bytes);
       }
+    }
+
+    // K-OF-N FILTER. Iter 43 demonstrated that a ring of N tabs attesting for each other produces
+    // perfect mutual corroboration and sails past the forgery detector, because peerIds are free.
+    // This does not fix that — nothing here can, since a 2-member ring is byte-identical to two
+    // honest peers — but it METERS it: credit only counts when at least K DISTINCT attesters vouch,
+    // and no single attester can contribute more than CAP of one peer's credit.
+    //
+    // The cap is the half that matters. A bare "≥K distinct attesters" rule is defeated for FREE by
+    // enlarging the ring: every member of a K+1 ring already has K attesters. Capping per-attester
+    // vouching means each fake identity must carry real traffic to be worth anything, so the
+    // attacker's cost scales with the credit claimed instead of being flat.
+    //
+    // ⚠ STILL NOT AN AUTHORISATION TO PAY. It raises the price of forgery; it does not make the
+    // number trustworthy. Only authenticated peer identity does that, and this MVP has none.
+    const attestedFilteredByClient = {};
+    let attestedFilteredTotal = 0;
+    for (const [key, v] of vouchers) {
+      if (v.size < MIN_ATTESTERS) continue;                   // too few independent witnesses
+      // Cap each voucher's contribution, then sum. Sorting is unnecessary — the cap is per-attester.
+      let sum = 0;
+      for (const bytes of v.values()) sum += Math.min(bytes, MAX_VOUCH_PER_ATTESTER);
+      attestedFilteredByClient[key] = sum;
+      attestedFilteredTotal += sum;
     }
 
     const total = http + p2p;
@@ -167,6 +205,13 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
       attestedUploadBytes: attestedTotal,
       attestedByClient,
       attestingClients: attestations.size,
+      // K-of-N FILTERED credit, reported ALONGSIDE the raw figure rather than replacing it. The gap
+      // between them is the point: a large drop means credit was resting on too few witnesses or on
+      // one voucher claiming too much. Hiding the raw number would hide that signal.
+      attestedFilteredUploadBytes: attestedFilteredTotal,
+      attestedFilteredByClient,
+      minAttesters: MIN_ATTESTERS,
+      maxVouchPerAttester: MAX_VOUCH_PER_ATTESTER,
       // Per-client SELF-REPORTED upload, so the two views can be diffed per viewer rather than
       // only in aggregate. A swarm-level total hides a single liar: one peer inflating its claim
       // while three report honestly barely moves the sum, but stands out per client.

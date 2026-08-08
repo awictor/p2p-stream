@@ -245,6 +245,86 @@ const advance = (ms) => { clock += ms; };
     check("garbage attestations ignored", s.attestedUploadBytes, 2200);
   }
 
+  console.log("\nK-of-N attestation filter: meters collusion, reported ALONGSIDE the raw figure:");
+  {
+    const p = Number(process.env.METRICS_TEST_PORT6 || 8128);
+    const srv = startMetrics(p);
+    await new Promise((r) => setTimeout(r, 400));
+    const b = `http://localhost:${p}`;
+    const post = (body) => fetch(`${b}/metrics`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const stats = () => fetch(`${b}/stats`).then((r) => r.json());
+    const MB = 1e6;
+
+    // ONE voucher claiming a lot: raw credits it, the filter does NOT (below MIN_ATTESTERS=2).
+    await post({ clientId: "solo", peerId: "p-solo", uploadBytes: 30 * MB });
+    await post({ clientId: "w1", peerId: "p-w1", attest: { "p-solo": 30 * MB } });
+    let s = await stats();
+    check("raw credits a single voucher", s.attestedByClient.solo, 30 * MB);
+    check("filtered does NOT (needs >= 2 distinct attesters)", s.attestedFilteredByClient.solo, undefined);
+    // Assert the REAL key. An earlier line here checked `attestedFilteredTotal` — a name that does
+    // not exist — so it "passed" by comparing undefined to undefined and tested nothing.
+    check("filtered total excludes it entirely", s.attestedFilteredUploadBytes, 0);
+    check("the threshold is reported so a reader knows why", s.minAttesters, 2);
+
+    // A SECOND distinct voucher crosses the threshold — but each is capped at 20MB.
+    await post({ clientId: "w2", peerId: "p-w2", attest: { "p-solo": 30 * MB } });
+    s = await stats();
+    check("raw sums both vouchers", s.attestedByClient.solo, 60 * MB);
+    // 2 vouchers x min(30MB, 20MB cap) = 40MB, NOT 60MB.
+    check("filtered caps each voucher at 20MB", s.attestedFilteredByClient.solo, 40 * MB);
+    checkTrue("so filtered is strictly less than raw", s.attestedFilteredUploadBytes < s.attestedUploadBytes);
+    check("the cap is reported too", s.maxVouchPerAttester, 20e6);
+
+    // An honest run keeps MOST of its credit: many receivers, each vouching a modest amount.
+    const p2 = Number(process.env.METRICS_TEST_PORT7 || 8129);
+    const srv2 = startMetrics(p2);
+    await new Promise((r) => setTimeout(r, 400));
+    const post2 = (body) => fetch(`http://localhost:${p2}/metrics`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    await post2({ clientId: "srv", peerId: "p-srv", uploadBytes: 12 * MB });
+    for (const w of ["h1", "h2", "h3", "h4"]) {
+      await post2({ clientId: w, peerId: `p-${w}`, attest: { "p-srv": 3 * MB } });
+    }
+    const s2 = await fetch(`http://localhost:${p2}/stats`).then((r) => r.json());
+    check("honest: raw credit is 4 x 3MB", s2.attestedByClient.srv, 12 * MB);
+    check("honest: filter keeps ALL of it (4 attesters, each under the cap)",
+      s2.attestedFilteredByClient.srv, 12 * MB);
+    checkTrue("honest runs are not punished by the filter",
+      s2.attestedFilteredUploadBytes === s2.attestedUploadBytes);
+    srv2.close();
+
+    // THE SYBIL RING from iter 43: 4 identities, each vouched by the other 3. It still gets
+    // credit — the filter cannot separate a ring from honest peers — but the per-attester cap
+    // means each fake identity is worth at most CAP, so credit no longer scales freely with the
+    // claim. Assert the METERING, and do not overclaim that the ring is stopped.
+    const p3 = Number(process.env.METRICS_TEST_PORT8 || 8130);
+    const srv3 = startMetrics(p3);
+    await new Promise((r) => setTimeout(r, 400));
+    const post3 = (body) => fetch(`http://localhost:${p3}/metrics`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const RING = ["s0", "s1", "s2", "s3"];
+    for (const me of RING) {
+      const attest = {};
+      // Each co-conspirator vouches 50MB — far above the 20MB cap.
+      for (const other of RING) if (other !== me) attest[`p-${other}`] = 50 * MB;
+      await post3({ clientId: me, peerId: `p-${me}`, uploadBytes: 150 * MB, attest });
+    }
+    const s3 = await fetch(`http://localhost:${p3}/stats`).then((r) => r.json());
+    check("ring raw credit per member is 3 x 50MB", s3.attestedByClient.s0, 150 * MB);
+    // 3 attesters x 20MB cap = 60MB, so the ring loses 90MB per member to the cap.
+    check("filtered caps it to 3 x 20MB", s3.attestedFilteredByClient.s0, 60 * MB);
+    checkTrue("the ring loses most of its inflated credit",
+      s3.attestedFilteredUploadBytes < s3.attestedUploadBytes * 0.5);
+    checkTrue("but it is NOT reduced to zero — the filter meters, it does not stop collusion",
+      s3.attestedFilteredByClient.s0 > 0);
+    srv3.close();
+    srv.close();
+  }
+
   console.log("\npeerId mappings are BOUNDED and stale ones stop resolving (iter 40 defects):");
   {
     // Two real bugs found by reading the attestation code: `peerToClient` had set/get but no

@@ -490,6 +490,16 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
       console.log(sig.suspects.length
         ? `  => ${sig.suspects.length} viewer(s) claim materially more than receivers confirm. DO NOT pay out on self-reported upload.`
         : `  => no viewer over-claims by >25%; self-reported and attested agree within normal report timing.`);
+      // K-of-N filtered credit, printed next to the raw figure. The GAP is the signal: a large drop
+      // means credit rested on too few witnesses or on one voucher claiming more than the cap.
+      if (typeof final.attestedFilteredUploadBytes === "number") {
+        const raw = final.attestedUploadBytes || 0;
+        const filt = final.attestedFilteredUploadBytes;
+        const kept = raw > 0 ? Math.round((filt / raw) * 100) : 0;
+        console.log(`  K-of-N filter (>=${final.minAttesters} attesters, <=${mb(final.maxVouchPerAttester)} each): ` +
+          `${mb(filt)} of ${mb(raw)} survives (${kept}%).`);
+        console.log(`  It METERS collusion — it cannot stop it. A ring is byte-identical to honest peers.`);
+      }
     }
 
     // The control arm is EXPECTED to show no P2P bytes, so the pass/fail verdict below
