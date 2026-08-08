@@ -79,7 +79,7 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 128 assertions: metrics (37) + tracker (15) + config (36) + dashboard (24) + start (16)
+npm test                  # 150 assertions: metrics 37, tracker 15, config 36, dashboard 24, start 16, ledger 22
 ```
 
 With the four services up:
@@ -120,21 +120,29 @@ runs the identical scenario twice — once normally, once with `?p2p=off` — an
 |---|---|---|
 | offload ratio | 68% | 0% |
 | **origin bytes** | **74.8MB** | **151.6MB** |
-| total fetched | 234.4MB | 151.6MB |
+| total fetched | 234.3MB | 151.6MB |
+| video obtained | 474s | 474s |
+| **KB per video-second** | **494** | **320** |
+| fetches / unique segment | 1.00x | 1.00x |
+| duplicate segments | 0 | 0 |
 | stalls | 0 | 0 |
 
 Origin egress fell by **51%**, not 68%, because the P2P arm fetched *more total bytes*. **Quote the
 control-arm subtraction, not the offload ratio.** The ratio is the flattering number.
 
-**The 1.52x total-byte gap is not yet explained, and it matters.** Both arms held the *same*
-474 video-seconds with *identical* 61s buffers, so the P2P arm fetched ~82.8MB (~127 segments)
-that the HTTP-only arm did not need. Amplification: **0.98x with P2P off** (fetches what it
-plays) versus **1.52x with P2P on**. Identical buffer depth rules out "P2P just prefetches
-deeper"; the open candidates are duplicate fetching (HTTP and P2P racing the same segment),
-discarded late arrivals, or double-counted accounting. Until it is attributed (tracked as
-P2P-0024), treat the viewer-side cost as **unquantified** — a viewer may be spending ~55% more
-total bandwidth to save the platform 51% of its origin bill, which is exactly the trade the
-ad-free tier would have to price.
+### The 1.52x total-byte gap is real, and the viewer pays it (attributed iter 29)
+
+The P2P arm moves **1.55x the bytes per second of video obtained** (494 KB vs 320 KB) for the
+*same* 474 video-seconds. A per-segment ledger attributes it: `fetches / unique segment` is
+**1.00x in both arms with zero duplicate deliveries**, so it is **not** double-counted accounting,
+**not** a duplicate fetch, and **not** HTTP racing P2P for the same segment. The extra bytes are
+*distinct segments* — read-ahead the viewer never played, or segments fetched and discarded.
+
+So the trade is explicit: **the platform saves 51% of its origin egress, and a relaying viewer
+spends ~55% more total bandwidth** (plus ~40MB of upload each) to provide it. On a metered or
+mobile connection that may not be a trade a viewer accepts, and it is the number the
+ad-free-for-relay tier has to be priced against. Earlier iterations attributed this gap to
+"P2P prefetches deeper"; identical buffer depth in both arms refuted that.
 
 The control arm also settles what the QoE figures mean: **both arms rebuffered zero times**, so
 the correct claim is "P2P cut origin bytes with no rebuffering introduced" — *not* that P2P

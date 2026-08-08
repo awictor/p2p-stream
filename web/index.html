@@ -55,6 +55,36 @@
     // Cumulative counters for THIS viewer. p2p-media-loader reports per-segment.
     let httpBytes = 0, p2pBytes = 0, uploadBytes = 0, peers = 0;
 
+    // Per-segment fetch ledger, to attribute the total-byte gap between P2P on and off.
+    // `fetches` counts delivery EVENTS; `seen` holds one entry per distinct segment URL.
+    // If fetches > seen, some segment was delivered more than once — and `dupBytes` is how
+    // much that cost. If they are equal, the extra bytes were distinct segments instead.
+    // Exposed on window for the harness; nothing in the UI depends on it.
+    const seen = new Map();   // url -> { count, bytes, sources:Set }
+    let fetches = 0, dupFetches = 0, dupBytes = 0;
+    function track(url, source, len) {
+      fetches++;
+      if (!url) return;       // no URL means we cannot dedupe; counted in fetches only
+      const prev = seen.get(url);
+      if (prev) {
+        prev.count++; prev.bytes += len; prev.sources.add(source);
+        dupFetches++; dupBytes += len;
+      } else {
+        seen.set(url, { count: 1, bytes: len, sources: new Set([source]) });
+      }
+    }
+    window.__ledger = () => {
+      // Which duplicates crossed transports (http AND p2p delivered the same segment) vs
+      // repeated on one — that distinguishes "the two loaders raced" from "one loader
+      // refetched". Different bugs, same byte total.
+      let crossTransport = 0;
+      for (const v of seen.values()) if (v.count > 1 && v.sources.size > 1) crossTransport++;
+      return {
+        fetches, unique: seen.size, dupFetches, dupBytes, crossTransport,
+        httpBytes, p2pBytes,
+      };
+    };
+
     const fmt = (b) => {
       if (b < 1024) return b + " B";
       const u = ["KB","MB","GB"]; let i = -1;
@@ -136,6 +166,16 @@
               const len = d.bytesLength || d.byteLength || 0;
               if (d.downloadSource === "p2p") p2pBytes += len;
               else httpBytes += len; // "http" (origin) or anything non-p2p
+              // Per-segment ledger. With P2P on, 4 viewers fetched 1.52x the bytes the
+              // HTTP-only arm needed for the SAME video and the SAME buffer depth, and the
+              // cause was unattributed. Counting EVENTS vs UNIQUE segment URLs separates the
+              // three candidates that look identical in a byte total:
+              //   events > unique          -> the same segment was delivered twice (real waste,
+              //                               or the same load reported twice = double-count)
+              //   events == unique         -> every fetch was a distinct segment, so the extra
+              //                               bytes are real distinct data (read-ahead/discard)
+              // Keyed by URL because that is what identifies a segment to both loaders.
+              track(d.segmentUrl || d.segment?.url, d.downloadSource, len);
               paint();
             });
             // CONTROL ARM ACCOUNTING. With isP2PDisabled the engine's loader checks
@@ -148,8 +188,12 @@
             // ever active, so there is no double counting.
             if (!cfg.p2pEnabled) {
               hls.on(window.Hls.Events.FRAG_LOADED, (_e, d) => {
-                httpBytes += (d && d.frag && d.frag.stats && d.frag.stats.total)
+                const len = (d && d.frag && d.frag.stats && d.frag.stats.total)
                   || (d && d.payload && d.payload.byteLength) || 0;
+                httpBytes += len;
+                // Same ledger for the control arm, or the two arms aren't comparable. The off
+                // arm is expected at ~1.0 fetches/segment, which is what makes it the baseline.
+                track(d && d.frag && d.frag.url, "http", len);
                 paint();
               });
             }

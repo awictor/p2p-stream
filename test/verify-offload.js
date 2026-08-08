@@ -289,6 +289,9 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
         const latency = h && typeof h.latency === "number" ? +h.latency.toFixed(1) : null;
         const buffered = vid && vid.buffered.length
           ? +(vid.buffered.end(vid.buffered.length - 1) - vid.currentTime).toFixed(1) : 0;
+        // Per-segment ledger: fetch EVENTS vs distinct segment URLs. This is what attributes
+        // the total-byte gap between arms instead of leaving it to a plausible story.
+        const led = typeof window.__ledger === "function" ? window.__ledger() : null;
         return {
           peers: document.getElementById("peers")?.textContent,
           ratio: document.getElementById("ratio")?.textContent,
@@ -296,11 +299,23 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
           p2pu: document.getElementById("p2pu")?.textContent,
           t: vid?.currentTime?.toFixed(1),
           stalls: q.stalls, stallMs: Math.round(q.stallMs), latency, buffered,
+          led,
+          // Video-seconds this viewer actually HOLDS (played + still buffered). The
+          // denominator for amplification: bytes fetched per second of video obtained.
+          // Derived from the media element, never from a byte count, so the two sides of the
+          // ratio are independent measurements.
+          heldS: +((vid?.currentTime || 0) + buffered).toFixed(1),
         };
       });
       qoe.push(v);
       console.log(`  tab${i}: t=${v.t}s peers=${v.peers} offload=${v.ratio} p2pDown=${v.p2pd} p2pUp=${v.p2pu}`);
       console.log(`         stalls=${v.stalls} (${(v.stallMs / 1000).toFixed(1)}s) latency=${v.latency ?? "n/a"}s buffer=${v.buffered}s`);
+      if (v.led) {
+        const dup = v.led.fetches - v.led.unique;
+        console.log(`         segments: ${v.led.fetches} fetches / ${v.led.unique} unique` +
+          ` = ${v.led.unique ? (v.led.fetches / v.led.unique).toFixed(2) : "n/a"}x` +
+          (dup > 0 ? `  DUPLICATES: ${dup} (${mb(v.led.dupBytes)}, ${v.led.crossTransport} cross-transport)` : "  no duplicates"));
+      }
     }
 
     const final = last || (await getJson(STATS_URL));
@@ -332,12 +347,37 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
       console.log(`                  ^ ${totalStalls} rebuffer(s): report this WITH the offload figure, never without`);
     }
 
+    // Segment ledger across all viewers. `fetches/unique` > 1 means some segment was delivered
+    // more than once; == 1 means every delivery was a distinct segment and the extra bytes in
+    // the P2P arm are real distinct data rather than a duplicate or a double-count.
+    const led = qoe.map((v) => v.led).filter(Boolean);
+    const ledger = led.length ? {
+      fetches: led.reduce((a, l) => a + l.fetches, 0),
+      unique: led.reduce((a, l) => a + l.unique, 0),
+      dupFetches: led.reduce((a, l) => a + l.dupFetches, 0),
+      dupBytes: led.reduce((a, l) => a + l.dupBytes, 0),
+      crossTransport: led.reduce((a, l) => a + l.crossTransport, 0),
+    } : null;
+    // Video-seconds obtained across viewers, and bytes fetched per second of it. Amplification
+    // is bytes-fetched ÷ bytes-needed, where "needed" comes from the media element's own
+    // timeline — NOT from buffer depth, which is exactly what made the prefetch theory look
+    // right at iter 25 when it was wrong.
+    const heldS = qoe.reduce((a, v) => a + (v.heldS || 0), 0);
+    const bytesPerVideoS = heldS ? (dHttp + dP2p) / heldS : 0;
+    if (ledger) {
+      const ratio = ledger.unique ? ledger.fetches / ledger.unique : 0;
+      console.log(`segment ledger:   ${ledger.fetches} fetches / ${ledger.unique} unique = ${ratio.toFixed(2)}x` +
+        `, duplicates ${ledger.dupFetches} (${mb(ledger.dupBytes)}), cross-transport ${ledger.crossTransport}`);
+      console.log(`video obtained:   ${heldS.toFixed(1)}s across ${qoe.length} viewers` +
+        ` -> ${(bytesPerVideoS / 1e3).toFixed(0)} KB per video-second`);
+    }
+
     summary = {
       viewers: VIEWERS, offloadPct: dPct, p2pBytes: dP2p, httpBytes: dHttp, uploadBytes: dUp,
       p2pSegments, peerConnects, pass: dP2p > 0 && p2pSegments > 0,
       // Cost side, carried out so --control can tabulate the two arms against each other.
       p2p, stalls: totalStalls, stallS: +totalStallS.toFixed(1), avgLatency: avgLat,
-      upPerViewer,
+      upPerViewer, ledger, heldS, bytesPerVideoS,
     };
 
     // Conservation check: every byte downloaded FROM a peer was uploaded BY a peer, so in a
@@ -416,11 +456,23 @@ async function runControl() {
   row("offload", on.offloadPct + "%", off.offloadPct + "%");
   row("origin bytes", mb(on.httpBytes), mb(off.httpBytes));
   row("p2p bytes", mb(on.p2pBytes), mb(off.p2pBytes));
-  // Total fetched is NOT the same across arms and hiding that would flatter P2P: the engine
-  // prefetches aggressively over P2P (p2pDownloadTimeWindow is 6000s), so the swarm pulls
-  // more total data than the HTTP-only arm. Origin egress still falls, which is the bill
-  // that matters — but "total bytes moved" goes UP, and a reader deserves to see it.
+  // Total fetched is NOT the same across arms and hiding that would flatter P2P. Origin egress
+  // still falls, which is the bill that matters — but "total bytes moved" goes UP, and a reader
+  // deserves to see it. The CAUSE is attributed below from the segment ledger, not guessed:
+  // an earlier iteration blamed prefetch, which the identical buffer depths refuted.
   row("total fetched", mb(on.httpBytes + on.p2pBytes), mb(off.httpBytes + off.p2pBytes));
+  // Normalise by video actually obtained. The arms rarely hold exactly the same number of
+  // video-seconds, and comparing raw totals across unequal denominators is how a fetch gap gets
+  // misattributed — at iter 25 the two arms happened to match, which made the raw comparison
+  // look safe. Per-video-second is the comparison that stays valid when they don't.
+  row("video obtained", `${(on.heldS || 0).toFixed(0)}s`, `${(off.heldS || 0).toFixed(0)}s`);
+  row("KB / video-sec", (on.bytesPerVideoS / 1e3).toFixed(0), (off.bytesPerVideoS / 1e3).toFixed(0));
+  if (on.ledger && off.ledger) {
+    const r = (l) => (l.unique ? (l.fetches / l.unique).toFixed(2) + "x" : "n/a");
+    row("fetches / unique", r(on.ledger), r(off.ledger));
+    row("duplicate segs", `${on.ledger.dupFetches} (${mb(on.ledger.dupBytes)})`,
+      `${off.ledger.dupFetches} (${mb(off.ledger.dupBytes)})`);
+  }
   row("upload/viewer", mb(on.upPerViewer), mb(off.upPerViewer));
   row("stalls", `${on.stalls} (${on.stallS}s)`, `${off.stalls} (${off.stallS}s)`);
   row("avg latency", on.avgLatency + "s", off.avgLatency + "s");
@@ -456,7 +508,39 @@ async function runControl() {
     console.log(`  That subtraction — not the offload ratio — is the bill a platform stops paying.`);
     if (savedPct < on.offloadPct) {
       console.log(`  NOTE: the real saving (-${savedPct}%) is SMALLER than the ${on.offloadPct}% offload ratio,`);
-      console.log(`  because the P2P arm fetched more total bytes (prefetch). Quote -${savedPct}%, not ${on.offloadPct}%.`);
+      console.log(`  because the P2P arm fetched more total bytes. Quote -${savedPct}%, not ${on.offloadPct}%.`);
+    }
+  }
+
+  // ATTRIBUTE the total-byte gap. This is the whole point of the segment ledger: the same byte
+  // total can come from a duplicate fetch, a double-counted event, or genuinely more distinct
+  // segments, and those are three different bugs (or one non-bug).
+  if (on.ledger && off.ledger) {
+    const onAmp = on.ledger.unique ? on.ledger.fetches / on.ledger.unique : 0;
+    const offAmp = off.ledger.unique ? off.ledger.fetches / off.ledger.unique : 0;
+    const onKB = on.bytesPerVideoS / 1e3, offKB = off.bytesPerVideoS / 1e3;
+    const perSecGap = offKB > 0 ? onKB / offKB : 0;
+    console.log("\nwhere the extra bytes went:");
+    if (on.ledger.dupFetches > 0) {
+      console.log(`  ${on.ledger.dupFetches} segment(s) were delivered MORE THAN ONCE with P2P on` +
+        ` (${mb(on.ledger.dupBytes)}), ${on.ledger.crossTransport} of them over both transports.`);
+      console.log(`  Cross-transport duplicates mean HTTP and P2P raced the same segment — real`);
+      console.log(`  wasted bandwidth. Same-transport repeats point at a refetch or a double-count.`);
+    } else {
+      console.log(`  NO duplicate deliveries (${onAmp.toFixed(2)} fetches/segment with P2P on,` +
+        ` ${offAmp.toFixed(2)} off). So the extra bytes are DISTINCT segments, not a duplicate`);
+      console.log(`  fetch and not a double-counted event — the swarm pulled more real data.`);
+    }
+    console.log(`  Per video-second: ${onKB.toFixed(0)} KB on vs ${offKB.toFixed(0)} KB off` +
+      ` = ${perSecGap.toFixed(2)}x` +
+      (perSecGap > 1.15
+        ? ` — a REAL amplification a relaying viewer pays for.`
+        : perSecGap < 1.15 && perSecGap > 0.85
+          ? ` — no meaningful amplification once normalised by video obtained.`
+          : ` — P2P fetched LESS per video-second.`));
+    if (perSecGap > 1.15 && on.ledger.dupFetches === 0) {
+      console.log(`  Distinct segments AND more bytes per video-second means read-ahead the viewer`);
+      console.log(`  never played, or segments fetched then discarded. Not an accounting bug.`);
     }
   } else {
     console.log(`  origin served MORE with P2P on (${mb(off.httpBytes)} -> ${mb(on.httpBytes)}); no saving measured.`);
