@@ -106,14 +106,33 @@ if [ "$MODE" = "vod" ]; then
   [ -n "$SRC" ] || { echo "[start] vod mode needs a source file: bash start.sh vod origin/vod.mp4" >&2; exit 1; }
   echo "[start] segmenting $SRC (one-shot, this takes a minute)..."
   if ! bash origin/segment.sh vod "$SRC" > "$LOGS/segment.log" 2>&1; then
-    echo "[start] FAILED segmenting — see origin/logs/segment.log" >&2
+    echo "[start] FAILED segmenting — see origin/logs/segment.log:" >&2
+    # Echo the actual reason. "see the log" makes the operator go find a file to learn that
+    # ffmpeg was missing (exit 127) or the source was corrupt (183) — say it here.
+    tail -n 3 "$LOGS/segment.log" 2>/dev/null | sed 's/^/[start]        /' >&2
     exit 1
   fi
   echo "[start] ok    segmenter (vod complete)"
 else
   bash origin/segment.sh "$MODE" ${SRC:+"$SRC"} > "$LOGS/segment.log" 2>&1 &
-  pids+=($!)
-  echo "[start] ok    segmenter (pid ${pids[-1]}, filling playlist)"
+  SEG_PID=$!
+  pids+=($SEG_PID)
+  # A BACKGROUNDED FAILURE IS INVISIBLE UNTIL SOMETHING CHECKS IT. Both ways the segmenter
+  # can die do so in under a second — a missing ffmpeg exits 127 (`exec: ffmpeg: not found`)
+  # and a corrupt/unreadable source exits 183 (`Invalid data found when processing input`).
+  # Without this check the script sails on to a 240s origin wait and 300s fragment wait, then
+  # blames "origin did not come up" — pointing at nginx when the real cause was ffmpeg and
+  # was already in segment.log. Give it a moment to fail, then look.
+  sleep 2
+  if ! kill -0 "$SEG_PID" 2>/dev/null; then
+    echo "" >&2
+    echo "[start] FAILED the segmenter exited immediately — see origin/logs/segment.log:" >&2
+    tail -n 3 "$LOGS/segment.log" 2>/dev/null | sed 's/^/[start]        /' >&2
+    echo "[start]        Common causes: no ffmpeg (populate bin/ or put ffmpeg on PATH)," >&2
+    echo "[start]        or an unreadable/corrupt source file." >&2
+    exit 1
+  fi
+  echo "[start] ok    segmenter (pid $SEG_PID, filling playlist)"
 fi
 
 # 2) nginx origin.

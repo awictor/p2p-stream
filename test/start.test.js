@@ -136,6 +136,82 @@ try {
       /-s stop/.test(SRC));
     checkTrue("the runtime probe file is removed on exit", /rm -f "\$ROOT\/\.probe\.mjs"/.test(SRC));
   }
+  console.log("\nsegmenter failure paths (iter 51): a dead segmenter must be caught, not waited out");
+  {
+    // WHY THIS EXISTS. In loop/rtmp mode the segmenter is BACKGROUNDED, so nothing looked at
+    // it again. Both ways it can die do so in under a second — measured: no ffmpeg exits 127
+    // (`exec: ffmpeg: not found`), a corrupt source exits 183 (`Invalid data found when
+    // processing input`). Before the fix the script went on to a 240s origin wait plus a 300s
+    // fragment wait and then blamed "origin did not come up", pointing the operator at nginx
+    // when segment.log already held the real reason. Nine minutes to the wrong answer.
+    checkTrue("captures the background segmenter's pid", /SEG_PID=\$!/.test(SRC),
+      "$! is only the LAST background pid; it must be saved before nginx overwrites it");
+    checkTrue("checks the segmenter is still alive before the long waits",
+      /kill -0 "\$SEG_PID"/.test(SRC),
+      "kill -0 tests existence without signalling");
+    // Order matters more than the check itself: after the origin wait it saves nothing.
+    const segCheckIdx = SRC.indexOf('kill -0 "$SEG_PID"');
+    const originWaitIdx = SRC.indexOf('wait_http "http://localhost:8080');
+    checkTrue("that check runs BEFORE the 240s origin wait",
+      segCheckIdx !== -1 && originWaitIdx !== -1 && segCheckIdx < originWaitIdx,
+      "checking after the wait saves none of the 240s it exists to avoid");
+    checkTrue("exits non-zero rather than continuing to the READY banner",
+      /kill -0 "\$SEG_PID"[\s\S]{0,600}?exit 1/.test(SRC));
+    // Both failure paths must print the REASON, not just name a file to go read.
+    const tails = SRC.match(/tail -n 3 "\$LOGS\/segment\.log"/g) || [];
+    check("both segmenter paths (vod + loop) tail the log into the error", tails.length, 2);
+    checkTrue("names the two real causes so the operator does not guess",
+      /no ffmpeg/i.test(SRC) && /corrupt/i.test(SRC));
+
+    // Now RUN them. Script text can claim anything; these are the actual exit codes.
+    const segRun = (args) => {
+      try {
+        execFileSync("bash", ["origin/segment.sh", ...args], {
+          cwd: ROOT, encoding: "utf8", stdio: "pipe",
+        });
+        return { code: 0, err: "" };
+      } catch (e) {
+        return { code: e.status, err: (e.stderr || "") + (e.stdout || "") };
+      }
+    };
+
+    const corrupt = path.join(ROOT, ".corrupt.test.mp4");
+    writeFileSync(corrupt, "not a video file at all");
+    try {
+      const r = segRun(["loop", corrupt]);
+      checkTrue("a corrupt source makes segment.sh exit non-zero", r.code !== 0,
+        `got exit ${r.code}`);
+      checkTrue("and says why (invalid data / error opening input)",
+        /Invalid data|Error opening input/i.test(r.err),
+        "the message is what start.sh now tails, so it has to be there");
+    } finally {
+      try { unlinkSync(corrupt); } catch { /* already gone */ }
+    }
+
+    // Missing ffmpeg: point FFMPEG at a path that does not exist. segment.sh falls back to
+    // PATH, so this only proves the failure when PATH has no ffmpeg either — assert that
+    // precondition instead of silently passing on a machine that has one installed.
+    {
+      let onPath = true;
+      try { execFileSync("ffmpeg", ["-version"], { stdio: "ignore" }); } catch { onPath = false; }
+      if (onPath) {
+        console.log("  SKIP  missing-ffmpeg path — ffmpeg IS on PATH here, so it cannot be absent");
+      } else {
+        const r = (() => {
+          try {
+            execFileSync("bash", ["origin/segment.sh", "loop", "origin/sample.mp4"], {
+              cwd: ROOT, encoding: "utf8", stdio: "pipe",
+              env: { ...process.env, FFMPEG: "/nonexistent/ffmpeg.exe" },
+            });
+            return { code: 0, err: "" };
+          } catch (e) { return { code: e.status, err: (e.stderr || "") + (e.stdout || "") }; }
+        })();
+        check("a missing ffmpeg exits 127 (command not found)", r.code, 127);
+        checkTrue("and names ffmpeg in the error", /ffmpeg/i.test(r.err));
+      }
+    }
+  }
+
   console.log("\ntwo-machine banner: the launcher must advertise the LAN address (iter 45)");
   {
     // The localhost block is correct for one box and WRONG across machines: the swarm id includes
