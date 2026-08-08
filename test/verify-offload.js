@@ -541,6 +541,10 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
         `, duplicates ${ledger.dupFetches} (${mb(ledger.dupBytes)}), cross-transport ${ledger.crossTransport}`);
       console.log(`video obtained:   ${heldS.toFixed(1)}s across ${qoe.length} viewers` +
         ` -> ${(bytesPerVideoS / 1e3).toFixed(0)} KB per video-second`);
+      // ...and the SPREAD behind that mean. The line above is a pooled average; the per-viewer
+      // figures it averages have been collected since iter 29 and never printed, so the tail was
+      // measurable all along. An ad-free tier priced on the mean underprices the worst-off viewer.
+      for (const line of viewerSpreadLines(viewerSpread(qoe))) console.log(line);
       // Played vs never-played. This is the count that says whether the amplification is
       // WASTE (fetched, never rendered — tunable) or merely READ-AHEAD the viewer went on to
       // watch (inherent, and no window value fixes it).
@@ -826,6 +830,84 @@ export function pricingLines(price, rateName) {
     `  ⚠ EXTRAPOLATED from a ${VIEWERS}-viewer loopback run of seconds, not a measured bill.` +
       ` Scales with participation: see the decay table.`,
   ];
+}
+
+/**
+ * Per-viewer bandwidth cost, and the SPREAD across viewers.
+ *
+ * Every cost figure this project publishes is a pooled mean: total bytes / total video-seconds.
+ * But `heldS` and the ledger's `httpBytes`/`p2pBytes` have been captured PER VIEWER since iter 29
+ * and averaged away at print time, so the tail was measurable all along and never looked at. That
+ * matters because the mean is what an ad-free tier would be priced on, and a late joiner plausibly
+ * pays far more than the mean — which is exactly the viewer who quits.
+ *
+ * Takes the `qoe` array (one entry per viewer, each with `heldS` and `led`). Viewers with no
+ * video-seconds are EXCLUDED rather than counted as zero: a tab that never played has no cost
+ * per video-second, and folding it in as 0 would drag the mean down and invent a rosier spread.
+ * Their count is returned so the exclusion is visible instead of silent.
+ */
+export function viewerSpread(qoe) {
+  const rows = [];
+  let noVideo = 0;
+  (qoe || []).forEach((v, i) => {
+    const held = v && typeof v.heldS === "number" ? v.heldS : 0;
+    const led = v && v.led;
+    if (!led || held <= 0) { noVideo++; return; }
+    const bytes = (Number(led.httpBytes) || 0) + (Number(led.p2pBytes) || 0);
+    rows.push({ viewer: i, kbPerVideoS: bytes / held / 1e3, bytes, heldS: held });
+  });
+  if (!rows.length) return null;
+  const vals = rows.map((r) => r.kbPerVideoS);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+  // Spread as a fraction of the MEAN, not of the min: "the worst viewer pays 1.4x the average" is
+  // the sentence a pricing decision needs. maxOverMean >= 1 always; 1.0 means perfectly even.
+  return {
+    rows,
+    n: rows.length,
+    noVideo,
+    min, max, mean,
+    maxOverMean: mean > 0 ? max / mean : null,
+    spreadPct: mean > 0 ? Math.round(((max - min) / mean) * 100) : null,
+    worst: rows.reduce((a, b) => (a.kbPerVideoS >= b.kbPerVideoS ? a : b)),
+    best: rows.reduce((a, b) => (a.kbPerVideoS <= b.kbPerVideoS ? a : b)),
+  };
+}
+
+/**
+ * The per-viewer lines. Returns [] when there is nothing to report.
+ *
+ * The 10% threshold splits two genuinely different outcomes and the wording has to differ:
+ * above it the tail is a finding, below it **the mean was representative** — which is an honest
+ * null result, not a reason to print a dramatic-sounding spread. Reporting "worst viewer 1.02x
+ * the mean" as though it were news would be manufacturing a finding out of noise.
+ */
+export function viewerSpreadLines(spread) {
+  if (!spread) return [];
+  const out = [`  per-viewer cost (KB per video-second), ${spread.n} viewer(s):`];
+  for (const r of spread.rows) {
+    out.push(`    tab${r.viewer}: ${r.kbPerVideoS.toFixed(0)} KB/video-s` +
+      ` (${(r.bytes / 1e6).toFixed(1)}MB over ${r.heldS.toFixed(0)}s)` +
+      (r.viewer === spread.worst.viewer && spread.n > 1 ? "   <- WORST" : ""));
+  }
+  if (spread.noVideo > 0) {
+    out.push(`    (${spread.noVideo} viewer(s) excluded: no video-seconds, so no cost per video-second)`);
+  }
+  if (spread.n < 2) {
+    out.push("    single viewer — no spread to report.");
+    return out;
+  }
+  out.push(`  min ${spread.min.toFixed(0)} / mean ${spread.mean.toFixed(0)} / max ${spread.max.toFixed(0)} KB/video-s` +
+    ` = ${spread.spreadPct}% spread, worst pays ${spread.maxOverMean.toFixed(2)}x the mean`);
+  if (spread.spreadPct >= 10) {
+    out.push(`  ⚠ tab${spread.worst.viewer} pays ${spread.maxOverMean.toFixed(2)}x the average.` +
+      ` Pricing an ad-free tier on the MEAN underprices that viewer,`);
+    out.push(`    and the worst-off viewer is the one who churns. Quote the max alongside the mean.`);
+  } else {
+    out.push(`  the mean was REPRESENTATIVE here (spread under 10%) — no tail to report, which is`);
+    out.push(`    a null result rather than a finding. It may not hold on a real network.`);
+  }
+  return out;
 }
 
 export function claimNumbers(on, off) {

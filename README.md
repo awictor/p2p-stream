@@ -80,9 +80,9 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 511 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
+npm test                  # 554 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
                           #                 ledger 37, claim 55, participation 35, forgery 29, sybil 29, origin 42,
-                          #                 viewer 27
+                          #                 viewer 27, spread 43
 ```
 
 With the four services up:
@@ -242,6 +242,30 @@ double-counted accounting, **not** a duplicate fetch, and **not** HTTP racing P2
 **78.1MB of segments pulled over the mesh and never appended to the media buffer** — which
 almost exactly accounts for the 76.9MB the origin saved. The control arm's **0%** is the
 sanity check that makes the 33% believable: a pure-HTTP viewer wastes nothing.
+
+#### The cost is not evenly shared, and the mean hides it (iter 57)
+
+Every cost figure above is a pooled mean. `verify` now also prints the per-viewer breakdown and
+the spread, because pricing an ad-free-for-relay tier on the mean underprices whoever pays most —
+and that is the viewer who churns. Measured at 4 viewers with the default 5s staggered joins:
+
+```
+tab0: 545 KB/video-s (46.9MB over 86s)
+tab1: 571 KB/video-s (46.9MB over 82s)
+tab2: 616 KB/video-s (46.9MB over 76s)
+tab3: 669 KB/video-s (46.9MB over 70s)   <- WORST
+min 545 / mean 601 / max 669 KB/video-s = 21% spread, worst pays 1.11x the mean
+```
+
+**The cause is join order, not P2P asymmetry.** Every viewer fetched *identical* bytes (46.9MB);
+the later joiners simply obtained less video in the same window, so their cost per video-second is
+higher. Re-running with `--stagger 0` gives **0% spread — all four at 522 KB/video-s** — which is
+the control that pins the mechanism. So the honest reading is that a late joiner pays more *for the
+duration of the run*, not that the mesh treats peers unequally.
+
+Below a 10% spread the harness says so explicitly ("the mean was REPRESENTATIVE … a null result
+rather than a finding") rather than dressing noise up as a tail. Whether a real network — where
+joins are genuinely staggered and uplinks differ — produces a wider spread is **unmeasured**.
 
 ### The waste is NOT tunable — read-ahead is what earns the offload (measured iter 33)
 
