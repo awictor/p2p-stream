@@ -112,9 +112,18 @@ runs the identical scenario twice — once normally, once with `?p2p=off` — an
 | total fetched | 234.4MB | 151.6MB |
 | stalls | 0 | 0 |
 
-Origin egress fell by **51%**, not 68%, because the P2P arm fetched *more total bytes* — the
-engine prefetches aggressively over P2P (`p2pDownloadTimeWindow` is 6000s). **Quote the
+Origin egress fell by **51%**, not 68%, because the P2P arm fetched *more total bytes*. **Quote the
 control-arm subtraction, not the offload ratio.** The ratio is the flattering number.
+
+**The 1.52x total-byte gap is not yet explained, and it matters.** Both arms held the *same*
+474 video-seconds with *identical* 61s buffers, so the P2P arm fetched ~82.8MB (~127 segments)
+that the HTTP-only arm did not need. Amplification: **0.98x with P2P off** (fetches what it
+plays) versus **1.52x with P2P on**. Identical buffer depth rules out "P2P just prefetches
+deeper"; the open candidates are duplicate fetching (HTTP and P2P racing the same segment),
+discarded late arrivals, or double-counted accounting. Until it is attributed (tracked as
+P2P-0024), treat the viewer-side cost as **unquantified** — a viewer may be spending ~55% more
+total bandwidth to save the platform 51% of its origin bill, which is exactly the trade the
+ad-free tier would have to price.
 
 The control arm also settles what the QoE figures mean: **both arms rebuffered zero times**, so
 the correct claim is "P2P cut origin bytes with no rebuffering introduced" — *not* that P2P
