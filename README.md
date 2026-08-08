@@ -80,8 +80,8 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 194 assertions: metrics 37, tracker 15, config 47, dashboard 24,
-                          #                 start 16, ledger 37, claim 19
+npm test                  # 229 assertions: metrics 37, tracker 15, config 47, dashboard 24, start 16,
+                          #                 ledger 37, claim 19, participation 35
 ```
 
 With the four services up:

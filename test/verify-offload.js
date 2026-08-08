@@ -155,20 +155,12 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
   // PARTICIPATION. `relayers` = how many of the viewers actually relay; the rest load with
   // ?p2p=off and are pure freeloaders. Null means "all of them", which is what every number in
   // this repo assumed until now — and no real deployment gets 100% participation.
-  const RELAYERS = relayers === null ? (p2p ? VIEWERS : 0) : Math.max(0, Math.min(VIEWERS, relayers));
-  // Per-viewer URL, because participation is a property of a VIEWER, not of a run. The control
-  // arm is the same page with one query param, so every viewer exercises the same player, the
-  // same origin and the same metrics path. Built via URL so an existing query string on
-  // VIEWER_URL survives instead of being clobbered by a naive "?p2p=off".
-  const urlFor = (i) => {
-    const url = new URL(VIEWER_URL);
-    // Relayers get the first slots so a staggered join puts a relayer in first — with a
-    // freeloader first there is nobody to pull from and early segments skew to HTTP.
-    if (i >= RELAYERS) url.searchParams.set("p2p", "off");
-    if (p2pWindow && i < RELAYERS) url.searchParams.set("p2pWindow", String(p2pWindow));
-    return url.toString();
-  };
-  const relayerAt = (i) => i < RELAYERS;
+  // Resolved by the unit-tested participationPlan() rather than inline, so the p2p/relayers
+  // precedence cannot drift back to silently overriding a control arm.
+  const plan = participationPlan({ viewers: VIEWERS, relayers, p2p, p2pWindow, baseUrl: VIEWER_URL });
+  const RELAYERS = plan.relayers;
+  const urlFor = plan.urlFor;
+  const relayerAt = plan.relayerAt;
   console.log(`verify-offload: ${VIEWERS} viewers, ${WATCH_S}s watch, ${STAGGER_S}s stagger, ` +
     `relaying ${RELAYERS}/${VIEWERS} (${Math.round((RELAYERS / VIEWERS) * 100)}%)` +
     (p2pWindow ? `, p2pWindow=${p2pWindow}s` : ""));
@@ -461,7 +453,7 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
       // The window the ENGINE reported, not what we asked for — so the sweep table cannot
       // claim a value that never applied.
       p2pWindow: effWindow,
-      relayers: RELAYERS, participationPct: Math.round((RELAYERS / VIEWERS) * 100),
+      relayers: RELAYERS, participationPct: plan.participationPct,
     };
 
     // Conservation check: every byte downloaded FROM a peer was uploaded BY a peer, so in a
@@ -520,6 +512,52 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
 // full watch window (stopEarly:false) or the on arm would exit at its first P2P byte and
 // the two arms would cover different amounts of playback, making every column
 // incomparable.
+// Participation plan for a run, as a PURE function so it can be unit-tested without a browser.
+// Decides how many viewers relay and what URL each one loads. Inline in runOnce this was only
+// reachable via a ~10-minute browser sweep, and it hid a real precedence bug: `{p2p:false,
+// relayers:3}` produced THREE relayers, silently overriding an explicit "P2P off". A mixed run
+// that reports a participation rate it never ran is the most misleading output this harness can
+// produce, so the resolution is now explicit and asserted.
+// Classify one participation row against the full-participation reference. Pure, so the
+// thresholds that decide the PUBLISHED conclusion ("graceful" vs "collapse") are testable rather
+// than only reachable through a 10-minute browser sweep.
+export function participationVerdict({ pct, relayers, savedPct, fullPct, fullSavedPct }) {
+  // A single relayer has no peer to pull from, so 0% is arithmetic, not a measurement. Calling
+  // that a collapse would report a certainty as a finding.
+  if (relayers < 2) return { kind: "not-measurable", expected: null, ratio: null };
+  if (savedPct === null || fullSavedPct === null || !fullPct) {
+    return { kind: "unknown", expected: null, ratio: null };
+  }
+  // If the mesh degraded gracefully, half the relayers would still save about half.
+  const expected = fullSavedPct * (pct / fullPct);
+  const ratio = expected > 0 ? savedPct / expected : 0;
+  const kind = ratio >= 0.85 ? "graceful" : ratio >= 0.5 ? "worse-than-proportional" : "collapse";
+  return { kind, expected, ratio };
+}
+
+export function participationPlan({ viewers, relayers = null, p2p = true, p2pWindow = null, baseUrl }) {
+  // p2p:false means OFF and wins over any relayer count — the caller asked for a control arm.
+  // Otherwise null means "everyone relays"; a number is clamped into [0, viewers].
+  const n = !p2p ? 0
+    : relayers === null ? viewers
+      : Math.max(0, Math.min(viewers, Math.floor(relayers)));
+  const relayerAt = (i) => i < n;
+  const urlFor = (i) => {
+    const url = new URL(baseUrl);
+    // Relayers get the FIRST slots so a staggered join puts a relayer in first — with a
+    // freeloader first there is nobody to pull from and early segments skew to HTTP.
+    if (!relayerAt(i)) url.searchParams.set("p2p", "off");
+    // The window override only means anything for a viewer that actually relays.
+    if (p2pWindow && relayerAt(i)) url.searchParams.set("p2pWindow", String(p2pWindow));
+    return url.toString();
+  };
+  return {
+    relayers: n,
+    participationPct: viewers > 0 ? Math.round((n / viewers) * 100) : 0,
+    relayerAt, urlFor,
+  };
+}
+
 // The claim arithmetic, pulled out as a PURE function so it can be unit-tested without a
 // browser or a running stack. Every externally quoted number comes through here, so a silent
 // error in it misreports the product's whole value proposition — that is exactly why it should
@@ -737,23 +775,19 @@ async function runParticipationSweep() {
     if (r === full.r) continue;
     const c = claimNumbers(r, off);
     if (!c || c.savedPct === null || fullSaved === null) continue;
-    // A SINGLE relayer can never offload — it has no peer to pull from, exactly like N=1 in the
-    // viewer sweep. Such a row is 0% by construction, not by measurement, and calling it a
-    // collapse would be reading an arithmetic certainty as a finding.
-    if (relayers < 2) {
+    const v = participationVerdict({
+      pct, relayers, savedPct: c.savedPct, fullPct: full.pct, fullSavedPct: fullSaved,
+    });
+    if (v.kind === "not-measurable") {
       console.log(`  at ${pct}%: -${c.savedPct}% — only ${relayers} relayer, which CANNOT offload` +
         ` (no peer to pull from). 0% here is arithmetic, not a measurement.`);
       continue;
     }
-    // Proportional expectation: half the relayers should still save roughly half, if the mesh
-    // degrades gracefully. Much worse than proportional means freeloaders break the mesh rather
-    // than merely shrinking it.
-    const expected = fullSaved * (pct / full.pct);
-    const ratio = expected > 0 ? c.savedPct / expected : 0;
-    const verdict = ratio >= 0.85 ? "graceful (≈proportional)"
-      : ratio >= 0.5 ? "WORSE than proportional"
+    if (v.kind === "unknown") continue;
+    const label = v.kind === "graceful" ? "graceful (≈proportional)"
+      : v.kind === "worse-than-proportional" ? "WORSE than proportional"
         : "COLLAPSE — mesh needs the missing peers";
-    console.log(`  at ${pct}%: -${c.savedPct}% (proportional would be -${expected.toFixed(0)}%) -> ${verdict}`);
+    console.log(`  at ${pct}%: -${c.savedPct}% (proportional would be -${v.expected.toFixed(0)}%) -> ${label}`);
   }
   if (VIEWERS < 8) {
     console.log(`  ⚠ only ${VIEWERS} viewers: each step removes a large fraction of the swarm, so low`);
