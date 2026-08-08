@@ -32,9 +32,18 @@
     <div class="card"><div class="label">P2P download bytes</div><div class="val" id="p2p">0</div></div>
     <div class="card"><div class="label">P2P upload bytes</div><div class="val" id="upload">0</div></div>
   </div>
+  <p><small>Upload is what relaying viewers PAID to produce the saving above. The harness
+    (<code>npm run verify</code>) also reports rebuffers and latency — a savings figure should
+    never be read without them.</small></p>
 
   <script>
     const fmt = (b) => {
+      // Coerce first. Only `b < 1024` used to guard the small case, so undefined/NaN/a
+      // string fell through to the divide loop and rendered the literal "NaN KB" (and
+      // null rendered "null B"). A broken number on the dashboard is worse than a zero:
+      // it reads as "the pipeline is broken" rather than "nothing measured yet".
+      b = Number(b);
+      if (!Number.isFinite(b) || b <= 0) return "0 B";
       if (b < 1024) return b + " B";
       const u = ["KB","MB","GB","TB"]; let i = -1;
       do { b /= 1024; i++; } while (b >= 1024 && i < u.length - 1);
