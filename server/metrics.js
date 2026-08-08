@@ -177,7 +177,11 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
     };
   }
 
-  app.listen(port, () => {
+  // RETURN the server handle so callers can close it. Without this a test that starts a metrics
+  // server can never exit — the listener holds the event loop open, so `node test/x.js` hangs
+  // until an external timeout kills it. That is survivable for a standalone probe but would stall
+  // `npm test` forever, so any test in the suite must be able to `.close()` what it started.
+  return app.listen(port, () => {
     console.log(`[metrics] dashboard http://localhost:${port}`);
     // Also print the LAN address: a viewer on another machine must POST here, and
     // "localhost" would resolve to that machine itself.

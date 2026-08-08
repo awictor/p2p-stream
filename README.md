@@ -80,8 +80,8 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 286 assertions: metrics 55, tracker 15, config 57, dashboard 24, start 16,
-                          #                 ledger 37, claim 19, participation 35, forgery 29
+npm test                  # 315 assertions: metrics 55, tracker 15, config 57, dashboard 24, start 16,
+                          #                 ledger 37, claim 19, participation 35, forgery 29, sybil 29
 ```
 
 With the four services up:
@@ -246,6 +246,35 @@ that claims bytes nobody received. Two deliberate asymmetries:
 
 Per-viewer matters more than the swarm total: one peer inflating its claim while three report
 honestly barely moves the aggregate, but stands out immediately per client.
+
+### 🚨 We attacked our own detector, and it is blind (demonstrated iter 43)
+
+`npm run test:sybil` runs a **collusion ring against a real metrics server** and asserts our own
+forgery signal **finds nothing**. It does. The attack:
+
+| | result |
+|---|---|
+| identities | 10, minted in one process |
+| video actually relayed | **0 bytes** |
+| attested credit produced | **500MB** |
+| suspects raised by our detector | **0** |
+| ratio reported per identity | a clean **1.00** |
+
+The mechanism is one line in the vendored engine — a peerId is `prefix +` `Math.random()`-derived
+characters (`function Rr(e)`), with no proof of work, possession, or uniqueness, and the
+`peerId → clientId` mapping is self-declared. **Identities are free**, so N tabs can vouch for each
+other and produce perfect mutual corroboration.
+
+**This cannot be fixed by tuning the threshold.** A 2-member ring and two honest peers who really
+served each other produce *byte-identical* data. There is no signal to separate them. The only real
+fix is making identities cost something — tracker-assigned or otherwise authenticated peer IDs,
+which changes the signaling contract and this MVP does not have.
+
+> **So: no reward tier can pay out on these numbers.** Receiver attestation raises the bar from
+> "edit one integer" to "run N tabs", and the detector catches a lone liar — both real improvements,
+> neither sufficient. A cheaper partial mitigation (require credit from ≥K distinct attesters *and*
+> cap per-attester vouching) is tracked as P2P-0038; note that a bare K-distinct rule is defeated
+> for free by making the ring bigger, which is why the cap matters.
 
 > Windows longer than the stream itself (here 180s) are indistinguishable from the default —
 > every segment is eligible either way. The harness now says so instead of printing them as
