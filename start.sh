@@ -59,20 +59,28 @@ cat > "$PROBE" <<'PROBEJS'
 // ("Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)") and exits 127 AFTER the fetch
 // already succeeded. That made every origin probe here look like a dead service and tore
 // down a healthy stack. Measured, not theorised.
+// In "frags" mode this ALWAYS prints exactly one integer and ALWAYS exits 0 — an unreachable
+// origin is legitimately "0 fragments", not an error. Printing 0 *and* exiting non-zero made
+// the caller's `$(probe ... || echo 0)` append a second 0, so bash received "0\n0" and died
+// with `[: 0 0: integer expression expected` on every poll before the playlist appeared.
 const url = process.argv[2];
 const want = process.argv[3]; // "frags" -> print fragment count instead of status
 try {
   const r = await fetch(url);
   if (want === "frags") {
-    const t = await r.text();
+    const t = r.ok ? await r.text() : "";
     console.log((t.match(/\.m4s/g) || []).length);
     process.exitCode = 0;
   } else {
     process.exitCode = r.ok ? 0 : 1;
   }
 } catch {
-  if (want === "frags") console.log(0);
-  process.exitCode = 1;
+  if (want === "frags") {
+    console.log(0);
+    process.exitCode = 0;
+  } else {
+    process.exitCode = 1;
+  }
 }
 PROBEJS
 
@@ -135,10 +143,17 @@ wait_http "http://localhost:8080/hls/stream.m3u8" "origin   :8080" 240 || exit 1
 # will "play" and measure ~0% offload, which reads as a broken product rather than an
 # impatient operator — so wait for it and SAY what we are waiting for.
 echo "[start] waiting for >= $MIN_FRAGS fragments (P2P needs runway to be measurable)..."
+# `ready` is what stops the timeout from silently becoming a success. Without it the loop
+# simply ended and the READY banner printed anyway — announcing a working stream on a playlist
+# that never filled, which is precisely the lie this script exists to prevent.
+ready=0
+n=0
 for ((i = 0; i < READY_TIMEOUT; i++)); do
-  n=$(node "$PROBE" "http://localhost:8080/hls/stream.m3u8" frags 2>/dev/null || echo 0)
-  if [ "${n:-0}" -ge "$MIN_FRAGS" ]; then
+  n=$(node "$PROBE" "http://localhost:8080/hls/stream.m3u8" frags 2>/dev/null)
+  n=${n:-0}
+  if [ "$n" -ge "$MIN_FRAGS" ]; then
     echo "[start] ok    playlist ($n fragments)"
+    ready=1
     break
   fi
   if [ $((i % 15)) -eq 0 ] && [ "$i" -gt 0 ]; then
@@ -146,6 +161,15 @@ for ((i = 0; i < READY_TIMEOUT; i++)); do
   fi
   sleep 1
 done
+
+if [ "$ready" -ne 1 ]; then
+  echo "" >&2
+  echo "[start] FAILED playlist stalled at $n/$MIN_FRAGS fragments after ${READY_TIMEOUT}s." >&2
+  echo "[start]        The stack is NOT ready — not printing URLs that would measure ~0% offload." >&2
+  echo "[start]        Check origin/logs/segment.log (is ffmpeg running? is the source file valid?)" >&2
+  echo "[start]        and origin/logs/error.log (is nginx serving origin/hls/?)." >&2
+  exit 1
+fi
 
 cat <<EOF
 
