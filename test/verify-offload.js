@@ -355,6 +355,11 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
       fetches: led.reduce((a, l) => a + l.fetches, 0),
       unique: led.reduce((a, l) => a + l.unique, 0),
       dupFetches: led.reduce((a, l) => a + l.dupFetches, 0),
+      played: led.reduce((a, l) => a + (l.played || 0), 0),
+      pending: led.reduce((a, l) => a + (l.pending || 0), 0),
+      wasted: led.reduce((a, l) => a + (l.wasted || 0), 0),
+      wastedBytes: led.reduce((a, l) => a + (l.wastedBytes || 0), 0),
+      noTiming: led.reduce((a, l) => a + (l.noTiming || 0), 0),
       dupBytes: led.reduce((a, l) => a + l.dupBytes, 0),
       crossTransport: led.reduce((a, l) => a + l.crossTransport, 0),
     } : null;
@@ -370,6 +375,18 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
         `, duplicates ${ledger.dupFetches} (${mb(ledger.dupBytes)}), cross-transport ${ledger.crossTransport}`);
       console.log(`video obtained:   ${heldS.toFixed(1)}s across ${qoe.length} viewers` +
         ` -> ${(bytesPerVideoS / 1e3).toFixed(0)} KB per video-second`);
+      // Played vs never-played. This is the count that says whether the amplification is
+      // WASTE (fetched, never rendered — tunable) or merely READ-AHEAD the viewer went on to
+      // watch (inherent, and no window value fixes it).
+      // played / pending / wasted. `pending` = ahead of the playhead but BUFFERED, so it would
+      // have been played had the run not been cut off — truncation, not cost. Only `wasted`
+      // (fetched, never appended to the media buffer) is real waste.
+      const timed = ledger.played + ledger.pending + ledger.wasted;
+      console.log(`segment fate:     ${ledger.played} played / ${ledger.pending} buffered-pending` +
+        ` / ${ledger.wasted} wasted` +
+        (timed ? ` = ${Math.round((ledger.wasted / timed) * 100)}% wasted` : "") +
+        ` (${mb(ledger.wastedBytes)})` +
+        (ledger.noTiming ? `, ${ledger.noTiming} untimed (excluded)` : ""));
     }
 
     summary = {
@@ -472,6 +489,14 @@ async function runControl() {
     row("fetches / unique", r(on.ledger), r(off.ledger));
     row("duplicate segs", `${on.ledger.dupFetches} (${mb(on.ledger.dupBytes)})`,
       `${off.ledger.dupFetches} (${mb(off.ledger.dupBytes)})`);
+    const waste = (l) => {
+      const timed = l.played + l.pending + l.wasted;
+      return timed ? `${l.wasted} (${Math.round((l.wasted / timed) * 100)}%)` : "n/a";
+    };
+    row("segs played", on.ledger.played, off.ledger.played);
+    row("buffered-pending", on.ledger.pending, off.ledger.pending);
+    row("wasted segs", waste(on.ledger), waste(off.ledger));
+    row("wasted MB", mb(on.ledger.wastedBytes), mb(off.ledger.wastedBytes));
   }
   row("upload/viewer", mb(on.upPerViewer), mb(off.upPerViewer));
   row("stalls", `${on.stalls} (${on.stallS}s)`, `${off.stalls} (${off.stallS}s)`);
@@ -538,9 +563,39 @@ async function runControl() {
         : perSecGap < 1.15 && perSecGap > 0.85
           ? ` — no meaningful amplification once normalised by video obtained.`
           : ` — P2P fetched LESS per video-second.`));
+    // IS IT TUNABLE? The never-played count is the deciding number. Waste (fetched, never
+    // rendered) can be tuned away by narrowing the P2P download window. Read-ahead the viewer
+    // DOES go on to watch is inherent to the mesh and no window value removes it — in that
+    // case the remedy is bounding upload per viewer, not tuning.
+    const onTimed = on.ledger.played + on.ledger.pending + on.ledger.wasted;
+    const onWastePct = onTimed ? (on.ledger.wasted / onTimed) * 100 : null;
+    const offTimed = off.ledger.played + off.ledger.pending + off.ledger.wasted;
+    const offWastePct = offTimed ? (off.ledger.wasted / offTimed) * 100 : null;
+    if (onWastePct === null) {
+      console.log(`  Segment fate UNKNOWN: no segment carried timing, so waste cannot be counted.`);
+      console.log(`  (${on.ledger.noTiming} untimed.) Treat the tunability question as unanswered.`);
+    } else {
+      console.log(`  Segment fate: ${on.ledger.played} played, ${on.ledger.pending} buffered-pending,` +
+        ` ${on.ledger.wasted} WASTED = ${onWastePct.toFixed(0)}% (${mb(on.ledger.wastedBytes)})` +
+        `; control arm ${offWastePct === null ? "n/a" : offWastePct.toFixed(0) + "%"}.`);
+      // The control arm is the sanity check on the metric itself: a pure-HTTP viewer should
+      // waste almost nothing. If it reads high, the metric is counting truncation as waste
+      // (it did — an earlier version reported 51% for the HTTP-only arm, which is impossible).
+      if (offWastePct !== null && offWastePct > 10) {
+        console.log(`  ⚠ METRIC SUSPECT: the HTTP-only arm should waste ~0%, not ${offWastePct.toFixed(0)}%.`);
+        console.log(`    Treat the tunability verdict below as unproven until that is explained.`);
+      }
+      if (onWastePct >= 15) {
+        console.log(`  => TUNABLE. Most of the amplification is data the viewer never watched, so`);
+        console.log(`     narrowing p2pDownloadTimeWindow (default 6000s) should cut it. See P2P-0029.`);
+      } else {
+        console.log(`  => NOT TUNABLE by the download window. Nearly everything fetched WAS played,`);
+        console.log(`     so the extra bytes are read-ahead the viewer went on to watch, not waste.`);
+        console.log(`     Reducing the window would cut offload, not cost. Bound upload per viewer instead.`);
+      }
+    }
     if (perSecGap > 1.15 && on.ledger.dupFetches === 0) {
-      console.log(`  Distinct segments AND more bytes per video-second means read-ahead the viewer`);
-      console.log(`  never played, or segments fetched then discarded. Not an accounting bug.`);
+      console.log(`  Distinct segments AND more bytes per video-second: not an accounting bug.`);
     }
   } else {
     console.log(`  origin served MORE with P2P on (${mb(off.httpBytes)} -> ${mb(on.httpBytes)}); no saving measured.`);

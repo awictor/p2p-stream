@@ -60,9 +60,9 @@
     // If fetches > seen, some segment was delivered more than once — and `dupBytes` is how
     // much that cost. If they are equal, the extra bytes were distinct segments instead.
     // Exposed on window for the harness; nothing in the UI depends on it.
-    const seen = new Map();   // url -> { count, bytes, sources:Set }
+    const seen = new Map();   // url -> { count, bytes, sources:Set, startTime, endTime, played }
     let fetches = 0, dupFetches = 0, dupBytes = 0;
-    function track(url, source, len) {
+    function track(url, source, len, startTime, endTime) {
       fetches++;
       if (!url) return;       // no URL means we cannot dedupe; counted in fetches only
       const prev = seen.get(url);
@@ -70,17 +70,70 @@
         prev.count++; prev.bytes += len; prev.sources.add(source);
         dupFetches++; dupBytes += len;
       } else {
-        seen.set(url, { count: 1, bytes: len, sources: new Set([source]) });
+        // startTime/endTime come from the engine's segment object and are what make
+        // "was this segment ever actually played?" answerable. Undefined for the P2P-off
+        // arm (hls.js's FRAG_LOADED path supplies them separately).
+        seen.set(url, {
+          count: 1, bytes: len, sources: new Set([source]),
+          startTime, endTime, played: false,
+        });
       }
     }
+
+    // WAS IT PLAYED? The 1.55x amplification is attributed to "read-ahead or discard", but
+    // nobody had counted which — and that count decides whether the window can be tuned down
+    // at all. A segment counts as played once the playhead has passed its start; polling on
+    // timeupdate is enough because we only need "did the playhead ever reach here", not a
+    // frame-exact answer. Marking is monotonic (never un-played) so a seek cannot undo it.
+    function markPlayed() {
+      const v = document.querySelector("video");
+      if (!v) return;
+      const t = v.currentTime;
+      for (const s of seen.values()) {
+        if (s.played) continue;
+        // A segment is played once the playhead reaches its start. Using startTime (not
+        // endTime) avoids counting the segment currently mid-render as wasted.
+        if (typeof s.startTime === "number" && t >= s.startTime) s.played = true;
+      }
+    }
+
     window.__ledger = () => {
       // Which duplicates crossed transports (http AND p2p delivered the same segment) vs
       // repeated on one — that distinguishes "the two loaders raced" from "one loader
       // refetched". Different bugs, same byte total.
-      let crossTransport = 0;
-      for (const v of seen.values()) if (v.count > 1 && v.sources.size > 1) crossTransport++;
+      markPlayed();
+      const v = document.querySelector("video");
+      const t = v ? v.currentTime : 0;
+      // Is a segment's range inside what the media element currently holds? A fetched segment
+      // that is ahead of the playhead AND buffered will be played — it is pending, not wasted.
+      // One that is ahead but NOT buffered was fetched and never appended to MSE: that is the
+      // only thing that can honestly be called wasted.
+      const buffered = (s, e) => {
+        if (!v || !v.buffered) return false;
+        for (let i = 0; i < v.buffered.length; i++) {
+          // Tolerance because segment boundaries and buffered ranges rarely align exactly.
+          if (s >= v.buffered.start(i) - 0.5 && s <= v.buffered.end(i) + 0.5) return true;
+        }
+        return false;
+      };
+      let crossTransport = 0, played = 0, pending = 0, wasted = 0, wastedBytes = 0, noTiming = 0;
+      for (const s of seen.values()) {
+        if (s.count > 1 && s.sources.size > 1) crossTransport++;
+        if (typeof s.startTime !== "number") { noTiming++; continue; }
+        if (s.played) { played++; continue; }
+        // NOT-YET-PLAYED splits two ways, and conflating them was a real error: counting
+        // everything ahead of the playhead as "wasted" made the HTTP-only control arm read
+        // 51% wasted, which is impossible — it was just its end-of-run buffer. A run that is
+        // cut off always leaves a full buffer of unplayed segments; that is truncation, not cost.
+        if (buffered(s.startTime, s.endTime)) pending++;
+        else { wasted++; wastedBytes += s.bytes; }
+      }
       return {
         fetches, unique: seen.size, dupFetches, dupBytes, crossTransport,
+        // `noTiming` is reported rather than folded into either bucket: a segment we cannot
+        // time is unknown, not wasted, and quietly calling it wasted would manufacture the
+        // very result this measurement exists to test.
+        played, pending, wasted, wastedBytes, noTiming,
         httpBytes, p2pBytes,
       };
     };
@@ -175,7 +228,8 @@
               //   events == unique         -> every fetch was a distinct segment, so the extra
               //                               bytes are real distinct data (read-ahead/discard)
               // Keyed by URL because that is what identifies a segment to both loaders.
-              track(d.segmentUrl || d.segment?.url, d.downloadSource, len);
+              track(d.segmentUrl || d.segment?.url, d.downloadSource, len,
+                d.segment?.startTime, d.segment?.endTime);
               paint();
             });
             // CONTROL ARM ACCOUNTING. With isP2PDisabled the engine's loader checks
@@ -193,7 +247,12 @@
                 httpBytes += len;
                 // Same ledger for the control arm, or the two arms aren't comparable. The off
                 // arm is expected at ~1.0 fetches/segment, which is what makes it the baseline.
-                track(d && d.frag && d.frag.url, "http", len);
+                // hls.js's own fragment carries start/duration rather than start/end, so the
+                // control arm gets the same timing basis as the P2P arm and the two
+                // never-played counts stay comparable.
+                track(d && d.frag && d.frag.url, "http", len,
+                  d && d.frag && d.frag.start,
+                  d && d.frag && (d.frag.start + (d.frag.duration || 0)));
                 paint();
               });
             }
@@ -222,7 +281,12 @@
       // Without it, a broken flag would silently produce two identical P2P-on runs and
       // the comparison would look like "P2P makes no difference".
       window.__p2pEnabled = cfg.p2pEnabled;
-      hls.attachMedia(document.getElementById("video"));
+      const videoEl = document.getElementById("video");
+      // Mark segments played as the playhead moves, not only when the ledger is read. A live
+      // playlist evicts old fragments, and on a long run the playhead passes segments well
+      // before anyone asks — marking lazily would count those as never-played and invent waste.
+      videoEl.addEventListener("timeupdate", markPlayed);
+      hls.attachMedia(videoEl);
       hls.loadSource(cfg.streamUrl);
     } else {
       document.body.insertAdjacentHTML("beforeend",

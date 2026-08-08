@@ -79,7 +79,7 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 150 assertions: metrics 37, tracker 15, config 36, dashboard 24, start 16, ledger 22
+npm test                  # 165 assertions: metrics 37, tracker 15, config 36, dashboard 24, start 16, ledger 37
 ```
 
 With the four services up:
@@ -130,19 +130,34 @@ runs the identical scenario twice — once normally, once with `?p2p=off` — an
 Origin egress fell by **51%**, not 68%, because the P2P arm fetched *more total bytes*. **Quote the
 control-arm subtraction, not the offload ratio.** The ratio is the flattering number.
 
-### The 1.52x total-byte gap is real, and the viewer pays it (attributed iter 29)
+### The 1.55x gap is real, and it is WASTE — 33% of P2P fetches are never played (iter 31)
 
-The P2P arm moves **1.55x the bytes per second of video obtained** (494 KB vs 320 KB) for the
-*same* 474 video-seconds. A per-segment ledger attributes it: `fetches / unique segment` is
-**1.00x in both arms with zero duplicate deliveries**, so it is **not** double-counted accounting,
-**not** a duplicate fetch, and **not** HTTP racing P2P for the same segment. The extra bytes are
-*distinct segments* — read-ahead the viewer never played, or segments fetched and discarded.
+The P2P arm moves **1.55x the bytes per second of video obtained** (497 KB vs 321 KB) for the
+*same* 472 video-seconds. A per-segment ledger attributes it precisely. Every fetched segment is
+classified by its actual fate:
+
+| fate | P2P ON | P2P OFF |
+|---|---|---|
+| played | 117 | 117 |
+| buffered, pending (would have played) | 123 | 119 |
+| **fetched but never buffered — wasted** | **120 (33%, 78.1MB)** | **0 (0%)** |
+
+`fetches / unique segment` is **1.00x in both arms with zero duplicates**, so this is **not**
+double-counted accounting, **not** a duplicate fetch, and **not** HTTP racing P2P. It is
+**78.1MB of segments pulled over the mesh and never appended to the media buffer** — which
+almost exactly accounts for the 76.9MB the origin saved. The control arm's **0%** is the
+sanity check that makes the 33% believable: a pure-HTTP viewer wastes nothing.
+
+**This means the cost is tunable, not inherent.** `p2pDownloadTimeWindow` defaults to
+**6000 seconds** of read-ahead eligibility (vs 3000 for HTTP); narrowing it should cut the waste
+without touching the offload. Tracked as P2P-0029.
 
 So the trade is explicit: **the platform saves 51% of its origin egress, and a relaying viewer
-spends ~55% more total bandwidth** (plus ~40MB of upload each) to provide it. On a metered or
-mobile connection that may not be a trade a viewer accepts, and it is the number the
-ad-free-for-relay tier has to be priced against. Earlier iterations attributed this gap to
-"P2P prefetches deeper"; identical buffer depth in both arms refuted that.
+spends ~55% more total bandwidth** (plus ~40MB of upload each) to provide it — **and a third of
+that extra is currently pure waste, not payment for the saving.** On a metered or mobile
+connection that may not be a trade a viewer accepts, and it is the number the ad-free-for-relay
+tier has to be priced against. Earlier iterations attributed the gap to "P2P prefetches deeper";
+identical buffer depth in both arms refuted that.
 
 The control arm also settles what the QoE figures mean: **both arms rebuffered zero times**, so
 the correct claim is "P2P cut origin bytes with no rebuffering introduced" — *not* that P2P
