@@ -71,6 +71,8 @@ const sweepArg = (() => {
 // This package is "type":"module", so there is no bare `require` here. Playwright is a
 // CommonJS dep living OUTSIDE this repo, so build a require() bound to this file's URL.
 import { createRequire } from "module";
+import { fileURLToPath } from "url";
+import path from "path";
 const require = createRequire(import.meta.url);
 
 function loadPlaywright() {
@@ -453,6 +455,38 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
 // full watch window (stopEarly:false) or the on arm would exit at its first P2P byte and
 // the two arms would cover different amounts of playback, making every column
 // incomparable.
+// The claim arithmetic, pulled out as a PURE function so it can be unit-tested without a
+// browser or a running stack. Every externally quoted number comes through here, so a silent
+// error in it misreports the product's whole value proposition — that is exactly why it should
+// not live inline inside a 600-line async driver.
+//
+// NORMALISED BY VIDEO OBTAINED. Dividing raw origin bytes is only valid when both arms obtained
+// the same amount of video; when they differ, the raw formula credits P2P for video the control
+// arm played and the P2P arm did not. At iter 25/29/31 the arms happened to match (472s vs 472s)
+// so the raw number was right by luck. Per video-second is right by construction.
+export function claimNumbers(on, off) {
+  if (!on || !off) return null;
+  const originPerS = (a) => (a.heldS > 0 ? a.httpBytes / a.heldS : null);
+  const offPerS = originPerS(off), onPerS = originPerS(on);
+  const savedPct = (offPerS && onPerS !== null && offPerS > 0)
+    ? Math.round(((offPerS - onPerS) / offPerS) * 100)
+    : null;
+  // Raw (unnormalised) kept only so the two can be compared and a skew flagged.
+  const rawSavedPct = off.httpBytes > 0
+    ? Math.round(((off.httpBytes - on.httpBytes) / off.httpBytes) * 100)
+    : null;
+  // How unequal the arms' video is. Above a few percent the raw number stops being trustworthy
+  // and the normalised one must be quoted instead.
+  const videoSkewPct = off.heldS > 0
+    ? Math.round((Math.abs(on.heldS - off.heldS) / off.heldS) * 100)
+    : null;
+  return {
+    savedPct, rawSavedPct, videoSkewPct,
+    savedBytes: off.httpBytes - on.httpBytes,
+    offOriginPerS: offPerS, onOriginPerS: onPerS,
+  };
+}
+
 async function runControl() {
   console.log(`CONTROL: ${VIEWERS} viewers, ${WATCH_S}s watch — P2P ON vs P2P OFF\n`);
   console.log(`${"=".repeat(60)}\n=== ARM 1/2: P2P ON\n${"=".repeat(60)}`);
@@ -507,8 +541,8 @@ async function runControl() {
   const dStalls = on.stalls - off.stalls;
   // Quote the MEASURED origin reduction, not the offload ratio — they are different numbers
   // and the ratio is the larger, flattering one (see the note below the table).
-  const savedPctForClaim = off.httpBytes > 0
-    ? Math.round(((off.httpBytes - on.httpBytes) / off.httpBytes) * 100) : null;
+  const claim = claimNumbers(on, off);
+  const savedPctForClaim = claim && claim.savedPct;
   console.log("\ninterpretation:");
   if (on.stalls === 0 && off.stalls === 0) {
     console.log(`  Both arms rebuffered ZERO times, so the zero-stall result is NOT attributable`);
@@ -524,13 +558,23 @@ async function runControl() {
   }
   // The headline economic claim: the control arm's origin bytes are the bill WITHOUT P2P,
   // so this subtraction is the only direct measurement of what a platform stops paying for.
-  const savedBytes = off.httpBytes - on.httpBytes;
+  const savedBytes = claim ? claim.savedBytes : 0;
   if (off.httpBytes === 0) {
     console.log(`  origin comparison UNAVAILABLE: the control arm counted 0 bytes (see FAIL below).`);
+  } else if (claim.savedPct === null) {
+    console.log(`  origin comparison UNAVAILABLE: no video-seconds recorded, cannot normalise.`);
   } else if (savedBytes > 0) {
-    const savedPct = Math.round((savedBytes / off.httpBytes) * 100);
-    console.log(`  origin served ${mb(savedBytes)} less with P2P on (${mb(off.httpBytes)} -> ${mb(on.httpBytes)}, -${savedPct}%).`);
+    const savedPct = claim.savedPct;
+    console.log(`  origin served ${mb(savedBytes)} less with P2P on (${mb(off.httpBytes)} -> ${mb(on.httpBytes)}),`);
+    console.log(`  = -${savedPct}% per video-second (${(claim.offOriginPerS / 1e3).toFixed(0)} -> ${(claim.onOriginPerS / 1e3).toFixed(0)} KB/s of video).`);
     console.log(`  That subtraction — not the offload ratio — is the bill a platform stops paying.`);
+    // If the arms obtained materially different amounts of video, the raw byte subtraction
+    // credits P2P for video it never delivered. Say so rather than quietly publishing it.
+    if (claim.videoSkewPct !== null && claim.videoSkewPct > 3) {
+      console.log(`  ⚠ the arms obtained ${claim.videoSkewPct}% different video (${off.heldS.toFixed(0)}s vs ${on.heldS.toFixed(0)}s),`);
+      console.log(`    so the raw byte subtraction would have claimed -${claim.rawSavedPct}%. Quote the`);
+      console.log(`    per-video-second figure (-${savedPct}%); the raw one credits P2P for video it did not serve.`);
+    }
     if (savedPct < on.offloadPct) {
       console.log(`  NOTE: the real saving (-${savedPct}%) is SMALLER than the ${on.offloadPct}% offload ratio,`);
       console.log(`  because the P2P arm fetched more total bytes. Quote -${savedPct}%, not ${on.offloadPct}%.`);
@@ -626,7 +670,12 @@ async function runControl() {
   }
 }
 
+// Only drive browsers when RUN AS A SCRIPT. `claimNumbers` is exported for unit testing, and
+// without this guard a plain `import` of this file would launch Chromium and demand a live stack.
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+
 (async () => {
+  if (!isMain) return;
   if (CONTROL) {
     await runControl();
     return;

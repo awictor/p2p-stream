@@ -79,7 +79,8 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 165 assertions: metrics 37, tracker 15, config 36, dashboard 24, start 16, ledger 37
+npm test                  # 184 assertions: metrics 37, tracker 15, config 36, dashboard 24,
+                          #                 start 16, ledger 37, claim 19
 ```
 
 With the four services up:
@@ -129,6 +130,12 @@ runs the identical scenario twice — once normally, once with `?p2p=off` — an
 
 Origin egress fell by **51%**, not 68%, because the P2P arm fetched *more total bytes*. **Quote the
 control-arm subtraction, not the offload ratio.** The ratio is the flattering number.
+
+That 51% is measured **per video-second** (320 → 158 KB per second of video obtained), not as a raw
+byte subtraction. The distinction only matters when the two arms play unequal amounts of video —
+and then it matters a lot: a raw subtraction credits P2P for video the control arm played and the
+P2P arm did not. Here the arms matched (472s each) so both methods agree, but the harness now
+normalises by construction and flags any run where the arms diverge by more than 3%.
 
 ### The 1.55x gap is real, and it is WASTE — 33% of P2P fetches are never played (iter 31)
 
