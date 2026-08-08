@@ -58,6 +58,18 @@ const STAGGER_S = arg("stagger", 5);
 const HEADED = process.argv.includes("--headed");
 const CONTROL = process.argv.includes("--control");
 
+// --participation 100,75,50,25 -> run once per participation rate and tabulate what the platform
+// actually saves when only some viewers relay. Every other number in this repo assumes 100%.
+const participationArg = (() => {
+  const i = process.argv.indexOf("--participation");
+  if (i === -1) return null;
+  const raw = process.argv[i + 1];
+  if (!raw || raw.startsWith("--")) return [100, 75, 50, 25];
+  const ns = raw.split(",").map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n >= 0 && n <= 100);
+  return ns.length ? ns : null;
+})();
+
 // --windows 6000,600,120,30 -> run once per p2pDownloadTimeWindow value and tabulate offload
 // against the viewer's bandwidth cost. `default` runs with the knob untouched as the baseline.
 const windowsArg = (() => {
@@ -136,18 +148,29 @@ async function preflight() {
 // One measured run at a given viewer count. `stopEarly` short-circuits as soon as any P2P
 // byte appears (right for a pass/fail gate, wrong for measuring a ratio). Returns a summary
 // so the sweep can tabulate; also sets process.exitCode for single-run use.
-async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER_S, stopEarly = true, p2p = true, p2pWindow = null } = {}) {
+async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER_S, stopEarly = true, p2p = true, p2pWindow = null, relayers = null } = {}) {
   const VIEWERS = viewers;
   const WATCH_S = watchS;
   const STAGGER_S = staggerS;
-  // The control arm is the same page with one query param, so both arms exercise the same
-  // player, the same origin and the same metrics path. Built via URL so an existing query
-  // string on VIEWER_URL survives instead of being clobbered by a naive "?p2p=off".
-  const url = new URL(VIEWER_URL);
-  if (!p2p) url.searchParams.set("p2p", "off");
-  if (p2pWindow) url.searchParams.set("p2pWindow", String(p2pWindow));
-  const pageUrl = url.toString();
-  console.log(`verify-offload: ${VIEWERS} viewers, ${WATCH_S}s watch, ${STAGGER_S}s stagger, p2p=${p2p ? "ON" : "OFF"}` +
+  // PARTICIPATION. `relayers` = how many of the viewers actually relay; the rest load with
+  // ?p2p=off and are pure freeloaders. Null means "all of them", which is what every number in
+  // this repo assumed until now — and no real deployment gets 100% participation.
+  const RELAYERS = relayers === null ? (p2p ? VIEWERS : 0) : Math.max(0, Math.min(VIEWERS, relayers));
+  // Per-viewer URL, because participation is a property of a VIEWER, not of a run. The control
+  // arm is the same page with one query param, so every viewer exercises the same player, the
+  // same origin and the same metrics path. Built via URL so an existing query string on
+  // VIEWER_URL survives instead of being clobbered by a naive "?p2p=off".
+  const urlFor = (i) => {
+    const url = new URL(VIEWER_URL);
+    // Relayers get the first slots so a staggered join puts a relayer in first — with a
+    // freeloader first there is nobody to pull from and early segments skew to HTTP.
+    if (i >= RELAYERS) url.searchParams.set("p2p", "off");
+    if (p2pWindow && i < RELAYERS) url.searchParams.set("p2pWindow", String(p2pWindow));
+    return url.toString();
+  };
+  const relayerAt = (i) => i < RELAYERS;
+  console.log(`verify-offload: ${VIEWERS} viewers, ${WATCH_S}s watch, ${STAGGER_S}s stagger, ` +
+    `relaying ${RELAYERS}/${VIEWERS} (${Math.round((RELAYERS / VIEWERS) * 100)}%)` +
     (p2pWindow ? `, p2pWindow=${p2pWindow}s` : ""));
   console.log("preflight:");
   await preflight();
@@ -205,7 +228,7 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
           console.log(`  [tab${i}] ${t}`);
         }
       });
-      await page.goto(pageUrl, { waitUntil: "domcontentloaded" });
+      await page.goto(urlFor(i), { waitUntil: "domcontentloaded" });
       // Hook the engine directly so a P2P segment is impossible to miss or fake.
       await page.evaluate(() => {
         // QoE (cost side): a savings figure means nothing without what the viewer paid.
@@ -271,23 +294,29 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
     // Assert the arm is the arm we asked for. A control run that silently left P2P on
     // would produce a meaningless comparison that still LOOKS like a comparison, which is
     // worse than no baseline at all.
+    // Checked PER VIEWER, since participation is now per-viewer: viewer i must relay iff
+    // i < RELAYERS. A mixed run where the split silently failed would report a participation
+    // rate it never ran, which is the most misleading possible output.
     const armFlags = await Promise.all(pages.map((p) => p.evaluate(() => window.__p2pEnabled)));
-    const wrongArm = armFlags.filter((f) => f !== p2p).length;
+    const wrongArm = armFlags.filter((f, i) => f !== relayerAt(i)).length;
     if (wrongArm) {
-      console.error(`\nFAIL(2): ${wrongArm}/${armFlags.length} viewers reported p2pEnabled=${armFlags[0]}, expected ${p2p}.`);
-      console.error("  The ?p2p=off flag did not take effect, so this arm is not what it claims.");
+      console.error(`\nFAIL(2): ${wrongArm}/${armFlags.length} viewers have the wrong participation flag.`);
+      console.error(`  expected ${JSON.stringify(armFlags.map((_, i) => relayerAt(i)))}, got ${JSON.stringify(armFlags)}.`);
+      console.error("  The ?p2p=off flag did not take effect, so this run is not what it claims.");
       process.exit(2);
     }
-    console.log(`  arm confirmed: p2pEnabled=${p2p} on all ${armFlags.length} viewers`);
+    console.log(`  participation confirmed: ${armFlags.filter(Boolean).length}/${armFlags.length} viewers relaying`);
 
     // Read the window back OUT of the engine. A sweep whose knob silently failed would print a
     // table of near-identical rows and read as "tuning makes no difference" — worse than no
     // sweep, because it looks like evidence. Assert the value the engine actually holds.
     const windows = await Promise.all(pages.map((pg) =>
       pg.evaluate(() => (typeof window.__p2pWindow === "function" ? window.__p2pWindow() : null))));
-    const effWindow = windows[0];
+    // Only RELAYERS carry the window override, so read it from a relayer. windows[0] is a
+    // freeloader when nobody relays, and reporting its window would misdescribe the run.
+    const effWindow = RELAYERS > 0 ? windows[0] : null;
     if (p2pWindow) {
-      const wrong = windows.filter((w) => w !== p2pWindow).length;
+      const wrong = windows.filter((w, i) => relayerAt(i) && w !== p2pWindow).length;
       if (wrong) {
         console.error(`\nFAIL(2): asked for p2pDownloadTimeWindow=${p2pWindow} but the engine reports ${JSON.stringify(windows)}.`);
         console.error("  The knob did not take effect, so this row would be a fabricated data point.");
@@ -432,6 +461,7 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
       // The window the ENGINE reported, not what we asked for — so the sweep table cannot
       // claim a value that never applied.
       p2pWindow: effWindow,
+      relayers: RELAYERS, participationPct: Math.round((RELAYERS / VIEWERS) * 100),
     };
 
     // Conservation check: every byte downloaded FROM a peer was uploaded BY a peer, so in a
@@ -642,6 +672,99 @@ async function runWindowSweep() {
   process.exitCode = 0;
 }
 
+// --participation: what does the platform save when only SOME viewers relay?
+// Granting consent means granting refusal, so this is the number that decides whether the
+// headline saving survives an opt-out. The freeloaders are real viewers pulling real bytes from
+// the origin — they are part of the bill, not excluded from it.
+async function runParticipationSweep() {
+  console.log(`PARTICIPATION SWEEP: ${participationArg.join("%, ")}% of ${VIEWERS} viewers relaying` +
+    ` — ${WATCH_S}s watch each\n`);
+
+  // Baseline: nobody relays. That is the bill WITHOUT the product, and every row is measured
+  // against it. Same reason the control arm exists.
+  console.log(`${"=".repeat(60)}\n=== BASELINE: 0% relaying (P2P off)\n${"=".repeat(60)}`);
+  const off = await runOnce({ stopEarly: false, p2p: false, relayers: 0 });
+  await sleep(3000);
+
+  const rows = [];
+  for (const pct of participationArg) {
+    const relayers = Math.round((pct / 100) * VIEWERS);
+    console.log(`${"=".repeat(60)}\n=== participation ${pct}% (${relayers}/${VIEWERS} relaying)\n${"=".repeat(60)}`);
+    const r = await runOnce({ stopEarly: false, p2p: relayers > 0, relayers });
+    if (r) rows.push({ pct, relayers, r });
+    await sleep(3000);
+  }
+
+  if (!off || !rows.length) {
+    console.error("\nFAIL(2): baseline or sweep rows missing; nothing to compare.");
+    process.exitCode = 2;
+    return;
+  }
+
+  console.log(`\n${"=".repeat(72)}\nORIGIN SAVING vs PARTICIPATION RATE\n${"=".repeat(72)}`);
+  console.log("| relaying |  saving | KB/video-s | up/relayer | stalls | peers |");
+  console.log("|----------|---------|------------|------------|--------|-------|");
+  console.log(`| ${"0%".padStart(8)} | ${"—".padStart(7)} | ${(off.bytesPerVideoS / 1e3).toFixed(0).padStart(10)} |` +
+    ` ${"—".padStart(10)} | ${String(off.stalls).padStart(6)} | ${String(off.peerConnects).padStart(5)} |`);
+  for (const { pct, relayers, r } of rows) {
+    const c = claimNumbers(r, off);
+    // Upload per RELAYER, not per viewer: freeloaders upload nothing, and averaging over them
+    // would understate what the people actually carrying the swarm pay.
+    const upPerRelayer = relayers > 0 ? r.uploadBytes / relayers : 0;
+    console.log(`| ${String(pct + "%").padStart(8)} |` +
+      ` ${String(c && c.savedPct !== null ? `-${c.savedPct}%` : "n/a").padStart(7)} |` +
+      ` ${(r.bytesPerVideoS / 1e3).toFixed(0).padStart(10)} | ${mb(upPerRelayer).padStart(10)} |` +
+      ` ${String(r.stalls).padStart(6)} | ${String(r.peerConnects).padStart(5)} |`);
+  }
+
+  console.log("\ncsv:");
+  console.log("participation_pct,relayers,saved_pct,kb_per_video_s,upload_per_relayer_bytes,stalls,peer_connects");
+  for (const { pct, relayers, r } of rows) {
+    const c = claimNumbers(r, off);
+    console.log(`${pct},${relayers},${c && c.savedPct !== null ? c.savedPct : ""},` +
+      `${(r.bytesPerVideoS / 1e3).toFixed(0)},${relayers > 0 ? Math.round(r.uploadBytes / relayers) : 0},` +
+      `${r.stalls},${r.peerConnects}`);
+  }
+
+  // VERDICT: does the saving degrade gracefully, or collapse? Linear-ish decay means the claim
+  // just needs qualifying with a rate. A collapse means the product needs near-total
+  // participation to work at all, which is a much weaker business case than "-51%".
+  const full = rows.find((x) => x.pct === 100) || rows[0];
+  const fullSaved = (claimNumbers(full.r, off) || {}).savedPct;
+  console.log("\nverdict:");
+  console.log(`  at ${full.pct}% participation: -${fullSaved}% origin saving`);
+  for (const { pct, relayers, r } of rows) {
+    if (r === full.r) continue;
+    const c = claimNumbers(r, off);
+    if (!c || c.savedPct === null || fullSaved === null) continue;
+    // A SINGLE relayer can never offload — it has no peer to pull from, exactly like N=1 in the
+    // viewer sweep. Such a row is 0% by construction, not by measurement, and calling it a
+    // collapse would be reading an arithmetic certainty as a finding.
+    if (relayers < 2) {
+      console.log(`  at ${pct}%: -${c.savedPct}% — only ${relayers} relayer, which CANNOT offload` +
+        ` (no peer to pull from). 0% here is arithmetic, not a measurement.`);
+      continue;
+    }
+    // Proportional expectation: half the relayers should still save roughly half, if the mesh
+    // degrades gracefully. Much worse than proportional means freeloaders break the mesh rather
+    // than merely shrinking it.
+    const expected = fullSaved * (pct / full.pct);
+    const ratio = expected > 0 ? c.savedPct / expected : 0;
+    const verdict = ratio >= 0.85 ? "graceful (≈proportional)"
+      : ratio >= 0.5 ? "WORSE than proportional"
+        : "COLLAPSE — mesh needs the missing peers";
+    console.log(`  at ${pct}%: -${c.savedPct}% (proportional would be -${expected.toFixed(0)}%) -> ${verdict}`);
+  }
+  if (VIEWERS < 8) {
+    console.log(`  ⚠ only ${VIEWERS} viewers: each step removes a large fraction of the swarm, so low`);
+    console.log(`    rates are coarse. Re-run with --viewers 8+ before treating the shape as final.`);
+  }
+  console.log(`  Freeloaders pull from the ORIGIN, so they are part of the bill — that is why the`);
+  console.log(`  saving falls faster than the relayer count in a mesh that is already sparse.`);
+  console.log(`  Quote the participation rate alongside any saving figure.`);
+  process.exitCode = 0;
+}
+
 async function runControl() {
   console.log(`CONTROL: ${VIEWERS} viewers, ${WATCH_S}s watch — P2P ON vs P2P OFF\n`);
   console.log(`${"=".repeat(60)}\n=== ARM 1/2: P2P ON\n${"=".repeat(60)}`);
@@ -831,6 +954,10 @@ const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolv
 
 (async () => {
   if (!isMain) return;
+  if (participationArg) {
+    await runParticipationSweep();
+    return;
+  }
   if (windowsArg) {
     await runWindowSweep();
     return;

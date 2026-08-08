@@ -6,8 +6,9 @@ Live, browser-only, and it **measures the ratio** (% bytes served peer-to-peer v
 
 > **Status: working, and offload rises with swarm size — 45% at 2 viewers, 79% at 8.**
 > Measured against a P2P-off control arm, origin egress falls **51%** at 4 viewers with zero
-> rebuffering. (Offload ratio ≠ bill reduction — see below.)
-> Measured by `npm run verify:sweep` on one machine. Not yet reproduced across two machines.
+> rebuffering — **but only if every viewer relays.** At 50% participation the saving is 29%, at
+> 25% it is 7%. (Offload ratio ≠ bill reduction, and neither survives an opt-out — see below.)
+> Measured on one machine. Not yet reproduced across two machines.
 > See [Status](#-status-working--offload-rises-with-swarm-size).
 
 Not built from scratch: [`p2p-media-loader`](https://github.com/novage/p2p-media-loader)
@@ -89,6 +90,7 @@ npm run verify            # the ONLY accepted proof of offload (~2min)
 npm run verify:sweep      # offload vs viewer count, 1/2/4/8 (~4min)
 npm run verify:control    # P2P ON vs OFF, side by side (~2min)
 npm run verify:windows    # sweep p2pDownloadTimeWindow: saving vs viewer cost (~5min)
+npm run verify:participation  # saving vs % of viewers who actually relay (~5min)
 ```
 It drives 4 headless viewers, counts announces with/without `offers[]`, listens for the
 engine's own fault events, and prints a cause-specific diagnosis on failure. Exit codes:
@@ -182,6 +184,34 @@ budget or opt-out) rather than pretending the cost can be engineered away.
 > Windows longer than the stream itself (here 180s) are indistinguishable from the default —
 > every segment is eligible either way. The harness now says so instead of printing them as
 > data points; an earlier sweep included 6000 and 600 and produced two identical rows.
+
+### ⚠️ The saving needs near-total participation (measured iter 35)
+
+Consent implies refusal, so `npm run verify:participation` loads some viewers with `?p2p=off`
+(real viewers, pulling real bytes from the origin) and measures what the platform actually saves.
+At 8 viewers:
+
+| relaying | origin saving | KB/video-s | upload per relayer | stalls |
+|---|---|---|---|---|
+| 0% | — | 322 | — | 0 |
+| **100%** | **-69%** | 488 | 46.7MB | 0 |
+| 75% | -50% | 439 | 44.5MB | 0 |
+| 50% | -29% | 395 | 40.1MB | 0 |
+| 25% | -7% | 355 | 26.7MB | 0 |
+
+**The saving decays faster than the relayer count.** At 75% it is still roughly proportional
+(-50% vs a proportional -52%), but by 50% it lags (-29% vs -35%) and by 25% it has effectively
+collapsed (-7% vs -17%). Two compounding reasons: a freeloader still pulls its whole stream **from
+the origin**, so it adds to the bill it isn't helping reduce; and peer connections fall
+50 → 30 → 12 → 2, so the remaining relayers have progressively fewer partners to serve.
+
+Consequence for the business model: **the ad-free-for-relay tier is not a nice-to-have, it is what
+makes the economics work at all.** A 51%-or-69% saving assumes participation this design has to
+actively earn, and any quoted figure should carry the rate it assumes.
+
+> Every rate here has ≥2 relayers. A *single* relayer cannot offload — it has no peer to pull
+> from — so a 25%-of-4-viewers row reads 0% by arithmetic, not by measurement. The harness now
+> says so rather than reporting it as a collapse.
 
 So the trade is explicit: **the platform saves 51% of its origin egress, and a relaying viewer
 spends ~55% more total bandwidth** (plus ~40MB of upload each) to provide it — **and a third of
