@@ -1,0 +1,86 @@
+# docker-compose.yml — the four services, without installing ffmpeg or nginx by hand (P2P-0051).
+#
+#   docker compose up --build          # loop origin/sample.mp4 as a fake live stream
+#   MODE=vod SRC=origin/vod.mp4 docker compose up --build
+#
+# Then open http://localhost:5173 in 2+ tabs and watch http://localhost:8001.
+#
+# ── WHY THE PORTS ARE NOT NEGOTIABLE ───────────────────────────────────────────────────────
+# The viewer DERIVES its URLs from the page host: `${host}:8080/hls/stream.m3u8`,
+# `${host}:8000` and `${host}:8001` (web/p2p-config.js). So these four published ports are a
+# contract with the client, not a preference. Renumber one and the viewer silently talks to
+# nothing — test/compose.test.js asserts all four against the values the config derives.
+#
+# ── ONE SHARED VOLUME, AND IT IS THE WHOLE DESIGN ──────────────────────────────────────────
+# ffmpeg WRITES segments and nginx READS them, so `hls` is a named volume mounted into both.
+# Without it the origin serves an empty directory forever and the symptom is a viewer that
+# never starts — not an error anywhere.
+#
+# ── NOT VALIDATED ──────────────────────────────────────────────────────────────────────────
+# ⚠ `docker compose config` has NOT been run against this file: there is no docker binary in
+# the environment that wrote it. test/compose.test.js parses it and asserts the invariants that
+# fail silently (ports, the shared volume, service count, no secrets), but the syntax and the
+# images themselves are unverified. See the unchecked boxes in .p2p-loop/manual-qa.md.
+
+services:
+  # 1) Origin segmenter. ffmpeg turns a file into LL-HLS CMAF and writes into the shared volume.
+  #    The official ffmpeg image has no shell entrypoint quirks worth fighting, but segment.sh is
+  #    the single source of truth for the encoder flags (2s segments, fMP4, independent_segments,
+  #    LIST_SIZE 90 — all load-bearing and pinned by test/segment.test.js), so run THAT rather
+  #    than duplicating the flags here. It already falls back to a PATH ffmpeg when bin/ is
+  #    absent, which is exactly the container case.
+  segmenter:
+    image: jrottenberg/ffmpeg:6-ubuntu
+    entrypoint: ["/bin/bash", "/app/origin/segment.sh"]
+    command: ["${MODE:-loop}", "${SRC:-origin/sample.mp4}"]
+    working_dir: /app
+    volumes:
+      - .:/app:ro          # the scripts and the source video, read-only
+      - hls:/app/origin/hls # the ONE writable path: where segments land
+    restart: unless-stopped
+
+  # 2) nginx origin — the CDN stand-in whose egress we are trying to cut.
+  origin:
+    image: nginx:1.27-alpine
+    # -p sets the prefix; every relative path in nginx.conf (logs/, temp/, hls/) resolves under
+    # it, which is why the conf needs no container-specific edits.
+    command: ["nginx", "-p", "/app/origin", "-c", "/app/origin/nginx.conf", "-g", "daemon off;"]
+    volumes:
+      - ./origin/nginx.conf:/app/origin/nginx.conf:ro
+      - hls:/app/origin/hls:ro    # read-only: only the segmenter writes here
+      - origin-logs:/app/origin/logs
+      - origin-temp:/app/origin/temp
+    ports:
+      - "8080:8080"      # viewer derives ${host}:8080 — do not renumber
+    depends_on:
+      - segmenter
+
+  # 3) Tracker (WS signaling) + metrics/dashboard, both in one node process.
+  tracker:
+    image: node:22-alpine
+    working_dir: /app
+    command: ["node", "server/tracker.js"]
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"      # ws:// signaling — the viewer derives ${host}:8000
+      - "8001:8001"      # metrics POST target + dashboard
+    # MIN_ATTESTERS / MAX_VOUCH_PER_ATTESTER are read from env by server/metrics.js and are
+    # deliberately NOT set here: the defaults (2, 20MB) are the values every published number
+    # was measured with. Override them at the command line if you are exploring, not in a file.
+
+  # 4) Viewer static host. `-c-1` disables caching so an edited page reloads immediately;
+  #    --cors because the page is served from :5173 and fetches segments from :8080.
+  web:
+    image: node:22-alpine
+    working_dir: /app
+    command: ["npx", "http-server", "web", "-p", "5173", "-c-1", "--cors"]
+    volumes:
+      - .:/app
+    ports:
+      - "5173:5173"      # the page itself — every other URL is derived from this host
+
+volumes:
+  hls:            # ffmpeg writes, nginx reads. Without this the origin serves nothing.
+  origin-logs:    # egress.log lives here; test:origin parses it as a second instrument
+  origin-temp:    # nginx's client_body/proxy/fastcgi temp paths, per nginx.conf

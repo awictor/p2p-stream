@@ -36,6 +36,7 @@ Viewer: <video> + hls.js + p2p-media-loader <--HTTP fallback-- |
 | `test/*.test.js` | unit tests: ratio maths, signaling, viewer config, dashboard (`npm test`) |
 | `start.sh` | one-command bring-up of all four services, waits for real readiness (`npm start`) |
 | `deploy/Caddyfile` | TLS termination for an off-localhost deploy — WebRTC/MSE need a secure context |
+| `docker-compose.yml` | the four services in containers, no local ffmpeg/nginx install |
 
 ## Prereqs
 - Node 18+ (`crypto.randomUUID`, modern deps)
@@ -74,6 +75,24 @@ npm run web                    # 4) viewer      http://localhost:5173
 ```
 </details>
 
+### Or with Docker — no ffmpeg or nginx install
+
+```bash
+docker compose up --build                              # loop origin/sample.mp4 as fake live
+MODE=vod SRC=origin/vod.mp4 docker compose up --build   # VOD instead, no ~90s live fill
+```
+
+Four services, one shared `hls` volume (ffmpeg writes it, nginx reads it read-only). The published
+ports are **not** adjustable: the viewer derives `${host}:8080`, `${host}:8000` and `${host}:8001`
+from the page host, so renumbering one leaves the viewer talking to nothing with no error.
+`npm run test:compose` asserts those ports *against `web/p2p-config.js` itself*, so a change to the
+derivation fails the test rather than silently disagreeing.
+
+> ⚠ `docker compose config` has **not** been run against this file — there is no docker binary
+> where it was written, so the syntax and the images are unverified. The test pins the invariants
+> that fail silently (ports, the shared volume, read-only consumer, no secrets); see the unchecked
+> boxes in `.p2p-loop/manual-qa.md`.
+
 ### Off localhost you need HTTPS + WSS — there is a config for it
 
 Local dev over `http://localhost` is fine (localhost counts as a secure context). Anywhere else,
@@ -99,9 +118,9 @@ copy-paste line and the full routing table.
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 617 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
+npm test                  # 643 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
                           #                 ledger 37, claim 55, participation 35, forgery 29, sybil 29, origin 42,
-                          #                 viewer 27, spread 43, deploy 31, verdict 32
+                          #                 viewer 27, spread 43, deploy 31, verdict 32, compose 26
 ```
 
 With the four services up:
