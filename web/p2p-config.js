@@ -77,6 +77,28 @@
       return Number.isFinite(n) && n > 0 ? n : null;
     })(),
 
+    // ?p2pMaxPeers=<n> raises the engine's peer cap (default 50). Added to settle whether the
+    // flattening top of our published offload curve was PHYSICS or the engine's peer POLICY: past
+    // the cap the engine evicts peers slowest-bandwidth-first every 30s, and the N=8 row had
+    // measured exactly 50 connects, which looked like the cap binding.
+    //
+    // MEASURED (iter 49, --sweep 8,12,16 --maxPeers 200): it was NOT the cap. N=8 measured 50
+    // connects AGAIN at cap 200, so the 50 was swarm shape, not a limit; connects ran 50/90/134,
+    // all well under 200, and offload still only went 80→84→85%. The flattening is real.
+    // Keep the flag anyway — it is the only way to prove a future flat row isn't policy.
+    //
+    // Null = leave the engine default alone. A non-positive or unparseable value must NOT become 0,
+    // which would mean "no peers at all" and would read as P2P being broken by the flag.
+    p2pMaxPeers: (() => {
+      const raw = q.get("p2pMaxPeers");
+      if (raw === null || raw === "") return null;
+      // FLOOR BEFORE the >0 test, not after. The other way round, `?p2pMaxPeers=0.5` passes
+      // n > 0 and then floors to 0 — the exact "connect to no peers" value this guard exists
+      // to prevent. Caught by test/config.test.js on the first run of that assertion.
+      const n = Math.floor(Number(raw));
+      return Number.isFinite(n) && n > 0 ? n : null;
+    })(),
+
     // ?uploadCapMB=<MB> stops this viewer relaying once it has uploaded that much. Measured
     // iter 33: the viewer's ~55% extra bandwidth is INHERENT to the design (narrowing the
     // download window cuts the saving just as fast), so the only remaining lever is consent —

@@ -16,6 +16,7 @@
  * Usage:
  *   node test/verify-offload.js [--viewers 4] [--watch 90] [--stagger 5] [--headed]
  *   node test/verify-offload.js --sweep 1,2,4,8 [--watch 45]
+ *   node test/verify-offload.js --sweep 8,12,16 --maxPeers 200 [--watch 45]
  *   node test/verify-offload.js --control [--watch 45]
  *
  * --control runs the SAME scenario twice — once with P2P on, once with `?p2p=off` — and
@@ -92,6 +93,20 @@ const sweepArg = (() => {
   return ns.length ? ns : null;
 })();
 
+// --maxPeers <n> raises the engine's p2pMaxPeers (default 50) on every relayer for the whole run.
+// It exists so a flattening sweep tail can be attributed: past the cap the engine evicts peers
+// slowest-bandwidth-first every 30s, so a row above the cap measures peer POLICY, not scaling.
+// Measured iter 49 at 8/12/16 with the cap at 200: connects 50/90/134, offload 80/84/85% — the
+// flattening is real, not the cap. Keep the flag; it is how any future flat row gets ruled out.
+const MAX_PEERS = (() => {
+  const i = process.argv.indexOf("--maxPeers");
+  if (i === -1) return null;
+  // Floor BEFORE the >0 test — `--maxPeers 0.5` would otherwise pass and floor to 0, which the
+  // viewer reads as "cap at zero peers". Same bug as in web/p2p-config.js; fixed in both.
+  const n = Math.floor(Number(process.argv[i + 1]));
+  return Number.isFinite(n) && n > 0 ? n : null;
+})();
+
 // This package is "type":"module", so there is no bare `require` here. Playwright is a
 // CommonJS dep living OUTSIDE this repo, so build a require() bound to this file's URL.
 import { createRequire } from "module";
@@ -148,7 +163,7 @@ async function preflight() {
 // One measured run at a given viewer count. `stopEarly` short-circuits as soon as any P2P
 // byte appears (right for a pass/fail gate, wrong for measuring a ratio). Returns a summary
 // so the sweep can tabulate; also sets process.exitCode for single-run use.
-async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER_S, stopEarly = true, p2p = true, p2pWindow = null, relayers = null } = {}) {
+async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER_S, stopEarly = true, p2p = true, p2pWindow = null, relayers = null, p2pMaxPeers = MAX_PEERS } = {}) {
   const VIEWERS = viewers;
   const WATCH_S = watchS;
   const STAGGER_S = staggerS;
@@ -157,13 +172,14 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
   // this repo assumed until now — and no real deployment gets 100% participation.
   // Resolved by the unit-tested participationPlan() rather than inline, so the p2p/relayers
   // precedence cannot drift back to silently overriding a control arm.
-  const plan = participationPlan({ viewers: VIEWERS, relayers, p2p, p2pWindow, baseUrl: VIEWER_URL });
+  const plan = participationPlan({ viewers: VIEWERS, relayers, p2p, p2pWindow, p2pMaxPeers, baseUrl: VIEWER_URL });
   const RELAYERS = plan.relayers;
   const urlFor = plan.urlFor;
   const relayerAt = plan.relayerAt;
   console.log(`verify-offload: ${VIEWERS} viewers, ${WATCH_S}s watch, ${STAGGER_S}s stagger, ` +
     `relaying ${RELAYERS}/${VIEWERS} (${Math.round((RELAYERS / VIEWERS) * 100)}%)` +
-    (p2pWindow ? `, p2pWindow=${p2pWindow}s` : ""));
+    (p2pWindow ? `, p2pWindow=${p2pWindow}s` : "") +
+    (p2pMaxPeers ? `, p2pMaxPeers=${p2pMaxPeers}` : ""));
   console.log("preflight:");
   await preflight();
 
@@ -319,6 +335,25 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
       console.log(`  window: p2pDownloadTimeWindow=${effWindow}s (engine default, not overridden)`);
     }
 
+    // Same readback rule for the peer cap, and it matters MORE here than for the window: the
+    // engine's default is 50, and the N=8 row happens to measure ~50 peer connects. A
+    // sweep past N=8 whose cap silently failed would measure the DEFAULT and read as "raising
+    // the cap changes nothing / offload plateaus" — a scaling limit that is policy, not physics.
+    const caps = await Promise.all(pages.map((pg) =>
+      pg.evaluate(() => (typeof window.__p2pMaxPeers === "function" ? window.__p2pMaxPeers() : null))));
+    const effMaxPeers = RELAYERS > 0 ? caps[0] : null;
+    if (p2pMaxPeers) {
+      const wrong = caps.filter((c, i) => relayerAt(i) && c !== p2pMaxPeers).length;
+      if (wrong) {
+        console.error(`\nFAIL(2): asked for p2pMaxPeers=${p2pMaxPeers} but the engine reports ${JSON.stringify(caps)}.`);
+        console.error("  The cap did not take effect, so this row would be a fabricated data point.");
+        process.exit(2);
+      }
+      console.log(`  peer cap confirmed: p2pMaxPeers=${effMaxPeers} (engine-reported)`);
+    } else if (effMaxPeers !== null && effMaxPeers !== undefined) {
+      console.log(`  peer cap: p2pMaxPeers=${effMaxPeers} (engine default, not overridden)`);
+    }
+
     console.log("watching:");
     const deadline = Date.now() + WATCH_S * 1000;
     let last = null;
@@ -453,6 +488,9 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
       // The window the ENGINE reported, not what we asked for — so the sweep table cannot
       // claim a value that never applied.
       p2pWindow: effWindow,
+      // Likewise engine-reported, not requested — the sweep table must not print a cap that
+      // never applied next to an offload number produced at the default.
+      p2pMaxPeers: effMaxPeers,
       relayers: RELAYERS, participationPct: plan.participationPct,
     };
 
@@ -568,7 +606,7 @@ export function participationVerdict({ pct, relayers, savedPct, fullPct, fullSav
   return { kind, expected, ratio };
 }
 
-export function participationPlan({ viewers, relayers = null, p2p = true, p2pWindow = null, baseUrl }) {
+export function participationPlan({ viewers, relayers = null, p2p = true, p2pWindow = null, p2pMaxPeers = null, baseUrl }) {
   // p2p:false means OFF and wins over any relayer count — the caller asked for a control arm.
   // Otherwise null means "everyone relays"; a number is clamped into [0, viewers].
   const n = !p2p ? 0
@@ -582,6 +620,8 @@ export function participationPlan({ viewers, relayers = null, p2p = true, p2pWin
     if (!relayerAt(i)) url.searchParams.set("p2p", "off");
     // The window override only means anything for a viewer that actually relays.
     if (p2pWindow && relayerAt(i)) url.searchParams.set("p2pWindow", String(p2pWindow));
+    // Same for the peer cap: a freeloader has no peers to cap.
+    if (p2pMaxPeers && relayerAt(i)) url.searchParams.set("p2pMaxPeers", String(p2pMaxPeers));
     return url.toString();
   };
   return {
@@ -1074,7 +1114,16 @@ const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolv
     return;
   }
 
-  console.log(`SWEEP: viewer counts ${sweepArg.join(", ")} — ${WATCH_S}s watch each\n`);
+  console.log(`SWEEP: viewer counts ${sweepArg.join(", ")} — ${WATCH_S}s watch each` +
+    (MAX_PEERS ? `, p2pMaxPeers=${MAX_PEERS}` : ", p2pMaxPeers=engine default (50)") + "\n");
+  // Any N above the peer cap cannot form a full mesh, so its offload number describes the CAP,
+  // not the swarm size. Say so up front rather than letting the curve imply otherwise.
+  const capLimit = MAX_PEERS || 50;
+  const overCap = sweepArg.filter((n) => n - 1 > capLimit);
+  if (overCap.length) {
+    console.log(`⚠ N=${overCap.join(",")} exceed p2pMaxPeers=${capLimit} (needs N-1 peers for a full mesh).`);
+    console.log("  Those rows measure the peer cap, not swarm scaling. Raise --maxPeers.\n");
+  }
   const rows = [];
   for (const n of sweepArg) {
     console.log(`${"=".repeat(60)}\n=== N=${n}\n${"=".repeat(60)}`);
@@ -1086,15 +1135,26 @@ const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolv
   }
 
   console.log(`\n${"=".repeat(60)}\nOFFLOAD vs VIEWER COUNT\n${"=".repeat(60)}`);
-  console.log("| viewers | offload | p2p bytes | http bytes | p2p segs | peer conns |");
-  console.log("|---------|---------|-----------|------------|----------|------------|");
+  console.log("| viewers | offload | p2p bytes | http bytes | p2p segs | peer conns | maxPeers |");
+  console.log("|---------|---------|-----------|------------|----------|------------|----------|");
   for (const r of rows) {
-    console.log(`| ${String(r.viewers).padStart(7)} | ${String(r.offloadPct + "%").padStart(7)} | ${mb(r.p2pBytes).padStart(9)} | ${mb(r.httpBytes).padStart(10)} | ${String(r.p2pSegments).padStart(8)} | ${String(r.peerConnects).padStart(10)} |`);
+    console.log(`| ${String(r.viewers).padStart(7)} | ${String(r.offloadPct + "%").padStart(7)} | ${mb(r.p2pBytes).padStart(9)} | ${mb(r.httpBytes).padStart(10)} | ${String(r.p2pSegments).padStart(8)} | ${String(r.peerConnects).padStart(10)} | ${String(r.p2pMaxPeers ?? "dflt").padStart(8)} |`);
   }
   console.log("\ncsv:");
-  console.log("viewers,offload_pct,p2p_bytes,http_bytes,p2p_segments,peer_connects");
+  console.log("viewers,offload_pct,p2p_bytes,http_bytes,p2p_segments,peer_connects,max_peers");
   for (const r of rows) {
-    console.log(`${r.viewers},${r.offloadPct},${r.p2pBytes},${r.httpBytes},${r.p2pSegments},${r.peerConnects}`);
+    console.log(`${r.viewers},${r.offloadPct},${r.p2pBytes},${r.httpBytes},${r.p2pSegments},${r.peerConnects},${r.p2pMaxPeers ?? ""}`);
+  }
+  // The whole point of P2P-0041: is a flat tail physics, or the engine hitting its own cap?
+  // peerConnects PEGGED at the cap is the tell. Print the diagnosis, don't leave it to a reader.
+  const pegged = rows.filter((r) => r.peerConnects >= capLimit);
+  if (pegged.length) {
+    console.log(`\n⚠ peer connects reached the cap (${capLimit}) at N=${pegged.map((r) => r.viewers).join(",")}.`);
+    console.log("  The engine evicts peers slowest-first every 30s past the cap, so any flattening");
+    console.log("  in those rows is PEER POLICY, not a scaling limit of P2P. Re-run with --maxPeers.");
+  } else if (MAX_PEERS) {
+    console.log(`\npeer connects stayed under the raised cap (${MAX_PEERS}) at every N,` +
+      " so the curve's shape is not the peer cap.");
   }
 
   // N=1 is EXPECTED to be 0%: a solo viewer has no peer to pull from, so zero P2P bytes is

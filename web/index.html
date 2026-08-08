@@ -237,6 +237,11 @@
             // that are never played (33%, iter 31) without touching the buffer. Spread only when
             // set, so the engine default is untouched on a normal run.
             ...(cfg.p2pWindowS ? { p2pDownloadTimeWindow: cfg.p2pWindowS } : {}),
+            // ?p2pMaxPeers raises the peer cap (engine default 50). Past the cap the engine evicts
+            // peers slowest-bandwidth-first every 30s, so a sweep point above it would measure
+            // eviction policy rather than scaling. Measured iter 49: at N=8/12/16 connects ran
+            // 50/90/134 with the cap at 200, so the flat tail is NOT the cap — see p2p-config.js.
+            ...(cfg.p2pMaxPeers ? { p2pMaxPeers: cfg.p2pMaxPeers } : {}),
           },
           onHlsJsCreated(hls) {
             const eng = hls.p2pEngine;
@@ -357,6 +362,14 @@
       window.__p2pWindow = () => {
         try {
           return hls.p2pEngine.getConfig().core.mainStream.p2pDownloadTimeWindow;
+        } catch { return null; }
+      };
+      // Same readback rule for the peer cap: prove the knob APPLIED rather than echoing what we
+      // asked for. A sweep whose cap silently failed would measure the default and read as
+      // "raising the cap changes nothing" — the most misleading result available.
+      window.__p2pMaxPeers = () => {
+        try {
+          return hls.p2pEngine.getConfig().core.mainStream.p2pMaxPeers;
         } catch { return null; }
       };
       const videoEl = document.getElementById("video");

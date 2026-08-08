@@ -4,7 +4,7 @@ Viewers relay live video segments to each other over WebRTC so the origin serves
 and peers fan out the rest, cutting the egress bill that dominates streaming costs.
 Live, browser-only, and it **measures the ratio** (% bytes served peer-to-peer vs origin).
 
-> **Status: working, and offload rises with swarm size — 45% at 2 viewers, 79% at 8.**
+> **Status: working, and offload rises with swarm size — 45% at 2 viewers, 80% at 8, 85% at 16.**
 > Measured against a P2P-off control arm, origin egress falls **51%** at 4 viewers with zero
 > rebuffering — **but only if every viewer relays.** At 50% participation the saving is 29%, at
 > 25% it is 7%. (Offload ratio ≠ bill reduction, and neither survives an opt-out — see below.)
@@ -111,8 +111,37 @@ to pull from, so offload climbs — which is the whole economic argument:
 | 4 | 67% | 236.5MB | 114.7MB | 12 |
 | 8 | **79%** | 585.8MB | 158.3MB | 50 |
 
+The 8/12/16 tail was measured in a separate run (`--maxPeers 200 --watch 45`), so its N=8 row is an
+independent repeat of the one above — 79% vs 80%, which is the run-to-run spread:
+
+| viewers | offload | served P2P | served by origin | peer connections | p2pMaxPeers |
+|---|---|---|---|---|---|
+| 8 | 80% | 373.2MB | 95.5MB | 50 | 200 |
+| 12 | 84% | 587.4MB | 115.6MB | 90 | 200 |
+| 16 | **85%** | 800.4MB | 136.9MB | 134 | 200 |
+
 `N=1` at 0% is correct — a lone viewer has no peer to pull from — and peer connections growing
-2→12→50 is the mesh fanning out rather than a star. `N=2` measured 45% and 44% on independent runs.
+2→12→50→134 is the mesh fanning out rather than a star. `N=2` measured 45% and 44% on independent runs.
+
+**The curve flattens: +34 points from N=2→8, +6 from N=8→16.** That tail is real, and we checked
+that it is not an artefact of the engine's own peer limit. `p2pMaxPeers` defaults to 50 and the N=8
+row measured *exactly* 50 connects, which looked like the cap binding — past it the engine evicts
+peers slowest-bandwidth-first every 30s, which would have made a flat tail a **policy** artefact
+rather than a property of P2P at scale. So the 8/12/16 rows above were re-measured with the cap
+raised to 200 (`--maxPeers 200`, read back out of the engine per viewer, run aborts on mismatch):
+
+- N=8 measured **50 connects again** with the cap at 200. The 50 was a coincidence of swarm shape,
+  not the limit — the original claim that our top row sat on the eviction threshold was wrong.
+- Connects at every N stayed well under 200 (50/90/134), so no row was cap-limited.
+
+The flattening is therefore not the peer cap. The likelier bound is that origin bytes never go to
+zero: someone must fetch each segment first, and every viewer's first segments arrive before it has
+peers. Origin bytes per viewer do keep falling (19.8 → 9.6 → 8.6 MB at N=8/12/16), so the platform
+does keep saving — the *ratio* is just approaching its ceiling. Reproduce:
+
+```bash
+node test/verify-offload.js --sweep 8,12,16 --maxPeers 200 --watch 45
+```
 
 ### ⚠️ The offload ratio is NOT the bill reduction (measured iter 25)
 

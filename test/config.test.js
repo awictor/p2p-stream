@@ -137,6 +137,32 @@ function load({ protocol = "http:", hostname = "localhost", search = "" } = {}) 
     check("P2P still enabled", tuned.p2pEnabled, true);
   }
 
+  console.log("\np2pMaxPeers: ?p2pMaxPeers= peer cap, must fail SAFE to the engine default (50):");
+  {
+    // null = leave the engine's 50 alone. A bad value must NOT become 0 — "connect to no peers"
+    // would read as P2P being broken by the flag rather than the flag being malformed. And the
+    // engine's cap is a peer COUNT, so a fractional value must be floored, never passed through.
+    check("absent -> null (engine default untouched)", load().p2pMaxPeers, null);
+    check("?p2pMaxPeers=200 -> 200", load({ search: "?p2pMaxPeers=200" }).p2pMaxPeers, 200);
+    check("?p2pMaxPeers=0 -> null, NOT 0", load({ search: "?p2pMaxPeers=0" }).p2pMaxPeers, null);
+    check("negative -> null", load({ search: "?p2pMaxPeers=-5" }).p2pMaxPeers, null);
+    check("non-numeric -> null", load({ search: "?p2pMaxPeers=abc" }).p2pMaxPeers, null);
+    check("empty -> null", load({ search: "?p2pMaxPeers=" }).p2pMaxPeers, null);
+    check("fractional is FLOORED (a peer count is an integer)", load({ search: "?p2pMaxPeers=12.7" }).p2pMaxPeers, 12);
+    check("0.5 floors to 0 -> must be null, not 0", load({ search: "?p2pMaxPeers=0.5" }).p2pMaxPeers, null);
+    check("Infinity -> null (not finite)", load({ search: "?p2pMaxPeers=Infinity" }).p2pMaxPeers, null);
+    // Same reason as the window: the sweep compares rows, so the cap must perturb nothing else.
+    const raised = load({ search: "?p2pMaxPeers=200" });
+    check("same streamUrl as an uncapped run", raised.streamUrl, load().streamUrl);
+    check("same swarmId as an uncapped run", raised.swarmId, load().swarmId);
+    check("P2P still enabled", raised.p2pEnabled, true);
+    check("does not disturb p2pWindowS", raised.p2pWindowS, null);
+    // Both knobs together — the N=8/12/16 sweep may set the cap while a window row is running.
+    const both = load({ search: "?p2pMaxPeers=200&p2pWindow=120" });
+    check("both flags: cap applies", both.p2pMaxPeers, 200);
+    check("both flags: window applies", both.p2pWindowS, 120);
+  }
+
   console.log("\nuploadCapMB: the consent knob, must fail SAFE to uncapped:");
   {
     // null = uncapped (today's behaviour). A malformed value must NOT become 0, which would mean
