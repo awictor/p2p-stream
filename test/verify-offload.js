@@ -6,6 +6,10 @@
  * actually moved peer-to-peer. A booting server or a playing <video> is NOT proof;
  * only `downloadSource === "p2p"` segments and a non-zero aggregate offload ratio are.
  *
+ * It also reports the COST side — rebuffers, stall seconds, latency behind the live edge,
+ * and upload bytes per viewer — printed immediately after the offload figure. A savings
+ * number must never appear without what the relaying viewer paid for it.
+ *
  * Requires all four services up (see README):
  *   origin segmenter + nginx :8080, tracker :8000, metrics :8001, web :5173
  *
@@ -173,6 +177,27 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
       await page.goto(VIEWER_URL, { waitUntil: "domcontentloaded" });
       // Hook the engine directly so a P2P segment is impossible to miss or fake.
       await page.evaluate(() => {
+        // QoE (cost side): a savings figure means nothing without what the viewer paid.
+        // Stalls come from the <video> element's own `waiting`/`playing` events rather
+        // than from engine stats, because that is what a human actually experiences —
+        // the engine can be happily fetching while the picture is frozen.
+        const v = document.querySelector("video");
+        window.__qoe = { stalls: 0, stallMs: 0, _t0: null };
+        if (v) {
+          v.addEventListener("waiting", () => {
+            // Ignore the initial buffering before playback ever starts; that is startup
+            // latency, not a rebuffer, and counting it would inflate every run by one.
+            if (v.currentTime > 0) { window.__qoe.stalls++; window.__qoe._t0 = performance.now(); }
+          });
+          const resume = () => {
+            if (window.__qoe._t0 != null) {
+              window.__qoe.stallMs += performance.now() - window.__qoe._t0;
+              window.__qoe._t0 = null;
+            }
+          };
+          v.addEventListener("playing", resume);
+          v.addEventListener("timeupdate", resume);
+        }
         const hls = window.__hls;
         if (!hls || !hls.p2pEngine) { console.log("P2PERR no engine"); return; }
         hls.p2pEngine.addEventListener("onSegmentLoaded", (d) => {
@@ -227,15 +252,28 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
     }
 
     console.log("\nper-viewer:");
+    const qoe = [];
     for (let i = 0; i < pages.length; i++) {
-      const v = await pages[i].evaluate(() => ({
-        peers: document.getElementById("peers")?.textContent,
-        ratio: document.getElementById("ratio")?.textContent,
-        p2pd: document.getElementById("p2pd")?.textContent,
-        p2pu: document.getElementById("p2pu")?.textContent,
-        t: document.querySelector("video")?.currentTime?.toFixed(1),
-      }));
+      const v = await pages[i].evaluate(() => {
+        const vid = document.querySelector("video");
+        const h = window.__hls;
+        const q = window.__qoe || { stalls: 0, stallMs: 0 };
+        // Latency behind the live edge, straight from hls.js (null for VOD, which has no edge).
+        const latency = h && typeof h.latency === "number" ? +h.latency.toFixed(1) : null;
+        const buffered = vid && vid.buffered.length
+          ? +(vid.buffered.end(vid.buffered.length - 1) - vid.currentTime).toFixed(1) : 0;
+        return {
+          peers: document.getElementById("peers")?.textContent,
+          ratio: document.getElementById("ratio")?.textContent,
+          p2pd: document.getElementById("p2pd")?.textContent,
+          p2pu: document.getElementById("p2pu")?.textContent,
+          t: vid?.currentTime?.toFixed(1),
+          stalls: q.stalls, stallMs: Math.round(q.stallMs), latency, buffered,
+        };
+      });
+      qoe.push(v);
       console.log(`  tab${i}: t=${v.t}s peers=${v.peers} offload=${v.ratio} p2pDown=${v.p2pd} p2pUp=${v.p2pu}`);
+      console.log(`         stalls=${v.stalls} (${(v.stallMs / 1000).toFixed(1)}s) latency=${v.latency ?? "n/a"}s buffer=${v.buffered}s`);
     }
 
     const final = last || (await getJson(STATS_URL));
@@ -251,6 +289,21 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
     console.log(`engine faults: ${engineFaults.length}${engineFaults.length ? ` (first: ${engineFaults[0]})` : ""}`);
     console.log(`aggregate offload: ${pct}% cumulative (p2p=${mb(final.p2pBytes)} http=${mb(final.httpBytes)})`);
     console.log(`this run only:    ${dPct}% (p2p=${mb(dP2p)} http=${mb(dHttp)} up=${mb(dUp)})`);
+
+    // THE COST SIDE. Printed immediately after the savings so the two are never separated:
+    // "79% cheaper" is not a shippable claim until it reads "and playback was no worse".
+    const totalStalls = qoe.reduce((a, v) => a + v.stalls, 0);
+    const totalStallS = qoe.reduce((a, v) => a + v.stallMs, 0) / 1000;
+    const lats = qoe.map((v) => v.latency).filter((x) => typeof x === "number");
+    const avgLat = lats.length ? (lats.reduce((a, b) => a + b, 0) / lats.length).toFixed(1) : "n/a";
+    const upPerViewer = qoe.length ? dUp / qoe.length : 0;
+    console.log(`QoE (cost):       stalls=${totalStalls} total (${totalStallS.toFixed(1)}s) across ${qoe.length} viewers` +
+      `, avg latency=${avgLat}s, upload/viewer=${mb(upPerViewer)}`);
+    if (totalStalls === 0) {
+      console.log(`                  no rebuffering observed — offload came at no visible playback cost`);
+    } else {
+      console.log(`                  ^ ${totalStalls} rebuffer(s): report this WITH the offload figure, never without`);
+    }
 
     summary = {
       viewers: VIEWERS, offloadPct: dPct, p2pBytes: dP2p, httpBytes: dHttp, uploadBytes: dUp,
