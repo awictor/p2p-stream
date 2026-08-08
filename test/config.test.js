@@ -137,6 +137,24 @@ function load({ protocol = "http:", hostname = "localhost", search = "" } = {}) 
     check("P2P still enabled", tuned.p2pEnabled, true);
   }
 
+  console.log("\nuploadCapMB: the consent knob, must fail SAFE to uncapped:");
+  {
+    // null = uncapped (today's behaviour). A malformed value must NOT become 0, which would mean
+    // "never relay" and make a typo look like the cap feature disabling P2P altogether.
+    check("absent -> null (uncapped)", load().uploadCapMB, null);
+    check("?uploadCapMB=25 -> 25", load({ search: "?uploadCapMB=25" }).uploadCapMB, 25);
+    check("?uploadCapMB=0 -> null, NOT 0", load({ search: "?uploadCapMB=0" }).uploadCapMB, null);
+    check("negative -> null", load({ search: "?uploadCapMB=-5" }).uploadCapMB, null);
+    check("non-numeric -> null", load({ search: "?uploadCapMB=abc" }).uploadCapMB, null);
+    check("empty -> null", load({ search: "?uploadCapMB=" }).uploadCapMB, null);
+    check("fractional allowed", load({ search: "?uploadCapMB=0.5" }).uploadCapMB, 0.5);
+    // The cap must not disturb anything else — a capped viewer is still in the same swarm.
+    const capped = load({ search: "?uploadCapMB=25" });
+    check("same swarmId", capped.swarmId, load().swarmId);
+    check("same streamUrl", capped.streamUrl, load().streamUrl);
+    check("P2P still enabled (cap limits upload, not participation)", capped.p2pEnabled, true);
+  }
+
   console.log("\nICE SERVERS — regression guard on the bug that cost nine iterations:");
   {
     const c = load();

@@ -55,6 +55,10 @@
     // Cumulative counters for THIS viewer. p2p-media-loader reports per-segment.
     let httpBytes = 0, p2pBytes = 0, uploadBytes = 0, peers = 0;
 
+    // Upload budget: stop relaying once we have served this many bytes. Null = uncapped.
+    const uploadCapBytes = cfg.uploadCapMB ? cfg.uploadCapMB * 1e6 : null;
+    let uploadCapped = false;
+
     // Per-segment fetch ledger, to attribute the total-byte gap between P2P on and off.
     // `fetches` counts delivery EVENTS; `seen` holds one entry per distinct segment URL.
     // If fetches > seen, some segment was delivered more than once — and `dupBytes` is how
@@ -150,7 +154,10 @@
       document.getElementById("peers").textContent = peers;
       document.getElementById("http").textContent = fmt(httpBytes);
       document.getElementById("p2pd").textContent = fmt(p2pBytes);
-      document.getElementById("p2pu").textContent = fmt(uploadBytes);
+      // Show the cap alongside the number. Consent needs a visible figure and a visible stop —
+      // "ad-free if you relay" without showing what relaying costs is a dark pattern.
+      document.getElementById("p2pu").textContent = fmt(uploadBytes) +
+        (uploadCapBytes !== null ? (uploadCapped ? " (capped)" : ` / ${cfg.uploadCapMB}MB`) : "");
     }
 
     if (window.Hls && Hls.isSupported()) {
@@ -276,6 +283,30 @@
             // onSegmentStart, onSegmentLoaded.
             eng.addEventListener("onChunkUploaded", (bytesLength) => {
               uploadBytes += Number(bytesLength) || 0;
+              // UPLOAD BUDGET (?uploadCapMB). Consent is the only lever left on the viewer's
+              // cost — narrowing the download window was measured dead at iter 33 because it
+              // cuts the origin saving just as fast. So let the viewer bound what they spend.
+              //
+              // Stops UPLOAD only: this viewer keeps downloading from peers and keeps playing,
+              // it just stops serving. Disabling download instead would push it back onto the
+              // origin and defeat the point.
+              //
+              // ⚠ THIS IS NOT AN ANTI-ABUSE CONTROL. `uploadBytes` is a page-side counter, so a
+              // modified client can under-report it and relay forever, or over-report it and
+              // claim credit for bytes it never sent. It bounds an HONEST viewer's bill; it does
+              // not defend the platform against a dishonest one. Any reward tier built on this
+              // number needs proof-of-delivery from the RECEIVING peer, not self-reporting.
+              if (uploadCapBytes !== null && !uploadCapped && uploadBytes >= uploadCapBytes) {
+                uploadCapped = true;
+                try {
+                  // Runtime toggle, verified in the vendored engine: applyDynamicConfig ->
+                  // core.applyDynamicConfig, and getUpdatedStreamProperty falls back to the
+                  // top-level key, so this covers main and secondary streams.
+                  eng.applyDynamicConfig({ core: { isP2PUploadDisabled: true } });
+                } catch (e) {
+                  console.log(`P2PWARN upload cap could not be applied: ${e && e.message}`);
+                }
+              }
               paint();
             });
             eng.addEventListener("onPeerConnect", () => { peers++; paint(); });
@@ -295,6 +326,16 @@
       // available. Same lesson as asserting the control arm is really the control arm.
       // Engine shape (verified in vendor source): HlsJsP2PEngine.getConfig() returns
       // { core: {...commonCoreConfig, mainStream, secondaryStream} }.
+      // Upload-budget state, read back from the ENGINE rather than echoing our own flag — a cap
+      // that silently failed to apply would look identical to a cap that worked but was never
+      // reached, and the harness must be able to tell those apart.
+      window.__uploadCap = () => {
+        let engineDisabled = null;
+        try {
+          engineDisabled = hls.p2pEngine.getConfig().core.mainStream.isP2PUploadDisabled;
+        } catch { /* engine not ready */ }
+        return { capMB: cfg.uploadCapMB, capped: uploadCapped, uploadBytes, engineDisabled };
+      };
       window.__p2pWindow = () => {
         try {
           return hls.p2pEngine.getConfig().core.mainStream.p2pDownloadTimeWindow;

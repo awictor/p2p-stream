@@ -80,7 +80,7 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 229 assertions: metrics 37, tracker 15, config 47, dashboard 24, start 16,
+npm test                  # 239 assertions: metrics 37, tracker 15, config 57, dashboard 24, start 16,
                           #                 ledger 37, claim 19, participation 35
 ```
 
@@ -178,8 +178,27 @@ viewer pays for *is* the mechanism that produces the offload — a peer can only
 it fetched early. Zero rebuffering at every value.
 
 So the viewer's ~55% extra bandwidth is **inherent to this design, not a misconfiguration.**
-The remaining lever is consent, not tuning: let a viewer bound what they contribute (an upload
-budget or opt-out) rather than pretending the cost can be engineered away.
+The remaining lever is consent, not tuning — which is what the upload budget below implements.
+
+### Upload budget: bound what a viewer spends (`?uploadCapMB=`)
+
+```
+http://localhost:5173/index.html?uploadCapMB=25
+```
+
+Once the viewer has served that many MB it **stops relaying and keeps watching.** Measured live
+with a 2MB cap: upload froze at 2.74MB and grew **0 bytes over the next 45 seconds**, the engine
+reported `isP2PUploadDisabled: true`, playback advanced the full 45s, and **peer downloads kept
+climbing** (35.1 → 46.3MB) — so a capped viewer stops *serving* without being pushed back onto the
+origin. An uncapped viewer in the same swarm was unaffected. The stat line shows `2.4 MB (capped)`,
+because consent needs a visible number and a visible stop.
+
+> **⚠ This is not an anti-abuse control, and must not be used as one.** The byte counter lives in
+> the page, so a modified client can under-report it and relay forever, or **over-report it and
+> claim credit for bytes it never sent**. The cap bounds an *honest* viewer's bill; it does not
+> defend the platform against a dishonest one. Any ad-free-for-relay reward built on this number
+> needs proof-of-delivery attested by the **receiving** peer — self-reported upload totals are
+> free money for a scripted client.
 
 > Windows longer than the stream itself (here 180s) are indistinguishable from the default —
 > every segment is eligible either way. The harness now says so instead of printing them as

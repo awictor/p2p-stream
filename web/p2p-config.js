@@ -77,6 +77,25 @@
       return Number.isFinite(n) && n > 0 ? n : null;
     })(),
 
+    // ?uploadCapMB=<MB> stops this viewer relaying once it has uploaded that much. Measured
+    // iter 33: the viewer's ~55% extra bandwidth is INHERENT to the design (narrowing the
+    // download window cuts the saving just as fast), so the only remaining lever is consent —
+    // let a viewer bound what they spend instead of pretending the cost can be tuned away.
+    //
+    // ⚠ SECURITY: this bounds an HONEST viewer's cost. It is NOT an anti-abuse control. The
+    // byte counter lives in the page and is trivially forgeable, so a modified client can
+    // report any figure it likes; see the note in index.html.
+    //
+    // Null = uncapped (today's behaviour). A non-positive or unparseable value must NOT become
+    // 0, which would mean "never relay" — a malformed flag would then silently look like the
+    // cap feature disabling P2P altogether.
+    uploadCapMB: (() => {
+      const raw = q.get("uploadCapMB");
+      if (raw === null || raw === "") return null;
+      const n = Number(raw);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    })(),
+
     // How often each viewer reports counters to the dashboard.
     reportIntervalMs: 3000,
   };
