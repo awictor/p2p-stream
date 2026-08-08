@@ -108,7 +108,39 @@ mid-stream, headless WebRTC.
 **Not yet proven: anything off localhost.** These viewers are tabs on one machine sharing a
 loopback path, so the numbers show the mesh, the scaling shape, and the accounting are real —
 not what a network with genuine RTT, packet loss, and asymmetric home uplinks would give. A
-two-machine run is the next credibility step.
+two-machine run is the next credibility step; see [Running across two machines](#running-across-two-machines).
+
+## Running across two machines
+
+On the host, start all four services and note the LAN address the tracker prints:
+
+```bash
+npm run origin:loop &   # wait ~180s for the 90-fragment playlist to fill
+npm run nginx & npm run tracker & npm run web &
+# [tracker] reachable from LAN at ws://192.168.68.66:8000
+```
+
+Then open **`http://<LAN_IP>:5173`** on every viewer — **including the host machine itself**.
+
+> ⚠️ **Never mix `localhost` with the LAN IP.** The swarm is identified by
+> `${version}-${swarmId}-${hash(streamUrl)}`, so the stream URL is part of the swarm identity.
+> A viewer on `http://localhost:5173` and one on `http://192.168.68.66:5173` derive different
+> stream URLs, join **different swarms**, and sit at 0 peers with no error message at all.
+
+The viewer derives the origin, tracker and metrics URLs from the page's own hostname, so no
+config editing is needed. Override individually with `?origin=`, `?tracker=`, `?metrics=`,
+`?host=` or `?swarm=` if the services are split across hosts.
+
+Watch `http://<LAN_IP>:8001` — offload above 0% with viewers on separate machines is the
+result that matters. Notes from testing this path:
+
+- **Plain `http://` is fine on a private IP.** Chromium permits WebRTC there. Only
+  `crypto.randomUUID()` is secure-context-gated, and the viewer now falls back when it is
+  unavailable — without that, every off-localhost viewer threw before playback started.
+- **Windows Firewall** may prompt on first run; allow Node and nginx on the private network or
+  ports 8080/8000/8001/5173 stay filtered and the second machine sees nothing.
+- **A phone on Wi-Fi works** (same LAN, same URL). A phone on **cellular cannot reach a LAN
+  IP** — that needs a routable origin plus HTTPS/WSS, which is not covered here.
 
 ### The bug that made this read 0% for nine iterations
 One invalid character sequence in our own ICE config:

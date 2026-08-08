@@ -35,8 +35,22 @@
 
   <script>
     const cfg = window.P2P_DEMO;
-    // Random per-viewer id (no Math.random dependence on crypto: use crypto.randomUUID).
-    const clientId = crypto.randomUUID();
+    // Random per-viewer id for the metrics dashboard.
+    // crypto.randomUUID() exists ONLY in a secure context, so on a plain-http LAN URL
+    // (exactly the cross-machine case) it is undefined and calling it throws
+    // "crypto.randomUUID is not a function" BEFORE the player is set up — which killed
+    // every off-localhost viewer. getRandomValues is also secure-context-only, hence the
+    // Math.random tail. This id only has to be unique among concurrent viewers, so a
+    // weak fallback is fine; nothing security-relevant depends on it.
+    const clientId = (() => {
+      if (window.crypto && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+      if (window.crypto && typeof crypto.getRandomValues === "function") {
+        const a = new Uint8Array(16);
+        crypto.getRandomValues(a);
+        return [...a].map((b) => b.toString(16).padStart(2, "0")).join("");
+      }
+      return `v-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    })();
 
     // Cumulative counters for THIS viewer. p2p-media-loader reports per-segment.
     let httpBytes = 0, p2pBytes = 0, uploadBytes = 0, peers = 0;
