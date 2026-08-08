@@ -1,0 +1,93 @@
+# Caddyfile — TLS termination for p2p-stream (P2P-0050).
+#
+# WHY THIS FILE EXISTS. WebRTC and MSE refuse to run in a non-secure context, so off-localhost
+# this product does not work at all over plain http: `crypto.randomUUID` is undefined (it threw
+# before the player was even constructed until the guard in web/index.html landed) and
+# RTCPeerConnection is unavailable. The viewer ALREADY derives https/wss from
+# `location.protocol` — asserted in test/config.test.js — so the client half shipped long ago
+# and has never been exercised. This is the missing server half.
+#
+# Caddy obtains a Let's Encrypt certificate for {$P2P_HOST} on first start, provided the DNS A
+# record points here and :80 and :443 are reachable. Nothing else is required.
+#
+# ── RUN ────────────────────────────────────────────────────────────────────────────────────
+#   npm start                                              # the four services, as usual
+#   P2P_HOST=stream.example.com caddy run --config deploy/Caddyfile
+#
+# Local test without a public DNS name (Caddy issues its own internal CA cert):
+#   P2P_HOST=localhost caddy run --config deploy/Caddyfile
+#
+# ── NO SECRETS HERE, EVER ──────────────────────────────────────────────────────────────────
+# The hostname comes from {$P2P_HOST}; TLS keys are generated and stored by Caddy OUTSIDE this
+# repo. If basic-auth or a TURN credential is added later it reads from an env var too — this
+# file is world-readable on GitHub.
+#
+# ── ONE ORIGIN, PATH-ROUTED — and the cost of that choice ──────────────────────────────────
+# The obvious alternative is to terminate TLS port-for-port (8080/8000/8001/5173) so the
+# viewer's DEFAULT derived URLs keep working untouched. That needs four internet-facing ports
+# and a cert covering all of them. This serves everything from ONE https origin instead: one
+# port, one cert.
+#
+# The cost, stated plainly: the viewer's default derived URLs are WRONG under this layout, so a
+# viewer must be opened with the three override params it already supports (see deploy/README.md
+# for a copy-paste line). There is no viewer-side config file to edit; the URL is the config.
+#
+# ⚠ THE SWARM-IDENTITY RULE STILL APPLIES, and TLS makes it easier to violate. The swarm hash
+# includes hash(streamUrl), so every viewer must resolve the IDENTICAL streamUrl string. Mixing
+# `https://HOST/hls/stream.m3u8` with `http://192.168.x.x:8080/hls/stream.m3u8` puts viewers in
+# DIFFERENT swarms: 0 peers, 0% offload, no error message anywhere. Pick one form and use it
+# everywhere, including on the machine running the stack.
+#
+# ⚠ NOT VALIDATED BY `caddy validate` — no caddy binary is available in this environment, so the
+# syntax here is unrun. test/deploy.test.js asserts the routing invariants that matter (every
+# backend port is proxied, prefixes are stripped only where the backend expects it), but
+# `caddy validate --config deploy/Caddyfile` is an unchecked box in manual-qa.md.
+
+{$P2P_HOST} {
+	# --- paths that pass through UNCHANGED, because the backend expects them ---
+
+	# nginx serves the playlist and segments at /hls/ (see origin/nginx.conf `location /hls/`),
+	# so the prefix must survive: `handle`, not `handle_path`.
+	handle /hls/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	# Express serves POST /metrics and GET /stats at those exact paths (server/metrics.js), so
+	# these pass through unchanged too.
+	handle /metrics* {
+		reverse_proxy 127.0.0.1:8001
+	}
+	handle /stats* {
+		reverse_proxy 127.0.0.1:8001
+	}
+
+	# --- paths that must be STRIPPED, because the backend serves them at its root ---
+
+	# The signaling tracker listens for websockets at the ROOT of :8000, so /tracker has to be
+	# removed: `handle_path` strips the matched prefix. Caddy performs the websocket Upgrade
+	# handshake automatically — no manual Connection/Upgrade header block, which would break
+	# plain HTTP requests to the same path. Getting this route wrong presents as "peers never
+	# connect" rather than an HTTP error, which is why test/deploy.test.js asserts it.
+	handle_path /tracker* {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	# The dashboard is Express's GET "/" handler, also at the backend root.
+	handle_path /dashboard* {
+		reverse_proxy 127.0.0.1:8001
+	}
+
+	# --- everything else is the viewer page (http-server on :5173) ---
+	handle {
+		reverse_proxy 127.0.0.1:5173
+	}
+
+	# Video segments are already compressed; gzipping them burns CPU for nothing. Caddy's
+	# `encode` skips incompressible types by content type, so this only affects the HTML/JS.
+	encode gzip
+
+	log {
+		output file logs/caddy-access.log
+		format json
+	}
+}

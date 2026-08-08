@@ -35,6 +35,7 @@ Viewer: <video> + hls.js + p2p-media-loader <--HTTP fallback-- |
 | `test/verify-offload.js` | the offload harness — the only accepted proof (`npm run verify`) |
 | `test/*.test.js` | unit tests: ratio maths, signaling, viewer config, dashboard (`npm test`) |
 | `start.sh` | one-command bring-up of all four services, waits for real readiness (`npm start`) |
+| `deploy/Caddyfile` | TLS termination for an off-localhost deploy — WebRTC/MSE need a secure context |
 
 ## Prereqs
 - Node 18+ (`crypto.randomUUID`, modern deps)
@@ -73,16 +74,34 @@ npm run web                    # 4) viewer      http://localhost:5173
 ```
 </details>
 
-> Local dev uses `ws://` and `http://` on localhost (allowed secure context). Deploying
-> off-localhost requires **HTTPS + WSS everywhere** — WebRTC and MSE refuse insecure
-> contexts. Update URLs in `web/p2p-config.js`.
+### Off localhost you need HTTPS + WSS — there is a config for it
+
+Local dev over `http://localhost` is fine (localhost counts as a secure context). Anywhere else,
+**WebRTC and MSE refuse to run**, so the viewer does not work at all over plain http. Nothing in
+the page needs editing — it already derives `https`/`wss` from `location.protocol` — you just need
+something terminating TLS:
+
+```bash
+npm start                                                # the four services
+P2P_HOST=stream.example.com caddy run --config deploy/Caddyfile
+```
+
+One https origin, path-routed (`/` viewer, `/hls/*` origin, `/tracker` signaling, `/metrics`
+`/stats` `/dashboard`), so only **ports 80 and 443** face the internet. Because paths replace
+ports, open the viewer with the override params it already supports — `deploy/README.md` has the
+copy-paste line and the full routing table.
+
+> ⚠ The Caddyfile has **not** been run through `caddy validate` or served real traffic (no caddy
+> binary where it was written). `npm run test:deploy` asserts the routing invariants that fail
+> *silently* — a wrong `/tracker` route reads as "peers never connect", not as an error — but the
+> syntax itself is unverified.
 
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 554 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
+npm test                  # 585 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
                           #                 ledger 37, claim 55, participation 35, forgery 29, sybil 29, origin 42,
-                          #                 viewer 27, spread 43
+                          #                 viewer 27, spread 43, deploy 31
 ```
 
 With the four services up:
@@ -496,7 +515,8 @@ result that matters. Notes from testing this path:
 - **Windows Firewall** may prompt on first run; allow Node and nginx on the private network or
   ports 8080/8000/8001/5173 stay filtered and the second machine sees nothing.
 - **A phone on Wi-Fi works** (same LAN, same URL). A phone on **cellular cannot reach a LAN
-  IP** — that needs a routable origin plus HTTPS/WSS, which is not covered here.
+  IP** — that needs a routable origin plus HTTPS/WSS, which `deploy/Caddyfile` now provides
+  (unrun; see the caveat there).
 
 ### The bug that made this read 0% for nine iterations
 One invalid character sequence in our own ICE config:
