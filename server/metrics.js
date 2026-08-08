@@ -9,7 +9,9 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-export function startMetrics(port) {
+// `now` is injectable purely so tests can drive the stale/evict windows deterministically
+// instead of sleeping for real seconds. Production always uses Date.now.
+export function startMetrics(port, { now = () => Date.now() } = {}) {
   const app = express();
   app.use(express.json());
   // Viewers live on a different origin (static web host); allow the POST.
@@ -20,7 +22,7 @@ export function startMetrics(port) {
     next();
   });
 
-  // clientId -> latest cumulative counters + lastSeen (ms epoch, from client).
+  // clientId -> latest cumulative counters + lastSeen (ms epoch, stamped SERVER-SIDE).
   const clients = new Map();
   const STALE_MS = 15000; // drop a viewer from the ACTIVE count if silent this long
   // Long-gone viewers are evicted from the Map so it cannot grow without bound on a
@@ -39,11 +41,18 @@ export function startMetrics(port) {
   app.post("/metrics", (req, res) => {
     const { clientId, httpBytes = 0, p2pBytes = 0, uploadBytes = 0, ts } = req.body || {};
     if (!clientId) return res.status(400).json({ error: "clientId required" });
+    // Recency is stamped SERVER-SIDE, not taken from the client. Trusting `ts` meant a
+    // report without one got lastSeen=0, and the `c.lastSeen &&` guards below then
+    // short-circuited on that falsy zero — so such a client was never stale, never
+    // evicted, and counted as an active viewer forever. Server time also can't be
+    // skewed by a wrong client clock or forged to keep an entry alive.
+    // `ts` is still accepted and echoed as `clientTs` for debugging; nothing reads it.
     clients.set(clientId, {
       httpBytes: Number(httpBytes) || 0,
       p2pBytes: Number(p2pBytes) || 0,
       uploadBytes: Number(uploadBytes) || 0,
-      lastSeen: Number(ts) || 0,
+      lastSeen: now(),
+      clientTs: Number(ts) || null,
     });
     res.json({ ok: true });
   });
@@ -52,32 +61,30 @@ export function startMetrics(port) {
   app.get("/", (req, res) => res.sendFile(path.join(__dirname, "dashboard.html")));
 
   function aggregate() {
-    // "active" = reported within STALE_MS of the newest report we hold.
-    let newest = 0;
-    for (const c of clients.values()) newest = Math.max(newest, c.lastSeen);
+    // Staleness is measured against server time, NOT against the newest report we hold.
+    // Comparing to the newest report meant a swarm that went entirely silent kept its
+    // final viewers "active" forever, because nothing newer ever arrived to age them out.
+    const t = now();
 
     // Reclaim entries far older than the stale window, folding their bytes into
     // `retired` so the totals below are unchanged by the eviction itself.
-    if (newest) {
-      for (const [id, c] of clients) {
-        if (c.lastSeen && newest - c.lastSeen > EVICT_MS) {
-          retired.httpBytes += c.httpBytes;
-          retired.p2pBytes += c.p2pBytes;
-          retired.uploadBytes += c.uploadBytes;
-          retired.count += 1;
-          clients.delete(id);
-        }
+    for (const [id, c] of clients) {
+      if (t - c.lastSeen > EVICT_MS) {
+        retired.httpBytes += c.httpBytes;
+        retired.p2pBytes += c.p2pBytes;
+        retired.uploadBytes += c.uploadBytes;
+        retired.count += 1;
+        clients.delete(id);
       }
     }
 
     let http = retired.httpBytes, p2p = retired.p2pBytes, upload = retired.uploadBytes;
     let active = 0;
     for (const c of clients.values()) {
-      const stale = newest && c.lastSeen && newest - c.lastSeen > STALE_MS;
       http += c.httpBytes;
       p2p += c.p2pBytes;
       upload += c.uploadBytes;
-      if (!stale) active += 1;
+      if (t - c.lastSeen <= STALE_MS) active += 1;
     }
     const total = http + p2p;
     return {

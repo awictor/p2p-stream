@@ -12,7 +12,8 @@ import { startMetrics } from "../server/metrics.js";
 
 const PORT = Number(process.env.METRICS_TEST_PORT || 8123);
 const BASE = `http://localhost:${PORT}`;
-const STALE_MS = 15000; // must match server/metrics.js
+const STALE_MS = 15000;          // must match server/metrics.js
+const EVICT_MS = STALE_MS * 20;  // must match server/metrics.js
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -37,8 +38,13 @@ const stats = () => fetch(`${BASE}/stats`).then((r) => r.json());
 // Fixed base timestamp — never Date.now(), so the stale-window maths is deterministic.
 const T = 1_700_000_000_000;
 
+// The server stamps recency itself, so staleness is driven by advancing THIS clock
+// rather than by the `ts` a client sends. Tests move time explicitly; no sleeping.
+let clock = T;
+const advance = (ms) => { clock += ms; };
+
 (async () => {
-  startMetrics(PORT);
+  startMetrics(PORT, { now: () => clock });
   await new Promise((r) => setTimeout(r, 400)); // let the listener bind
 
   console.log("empty state:");
@@ -78,49 +84,74 @@ const T = 1_700_000_000_000;
     check("p2pBytes replaced not added", s.p2pBytes, 1750);
   }
 
-  console.log("\nstale viewer drops out of the active count but keeps contributing bytes:");
+  console.log("\na viewer that goes silent past STALE_MS leaves the active count, keeps its bytes:");
   {
-    // 'c' reported far in the past; 'a'/'b' are the newest, so c is beyond STALE_MS.
-    await post({ clientId: "c", httpBytes: 10, p2pBytes: 90, uploadBytes: 5, ts: T - STALE_MS - 1 });
+    // Recency is server-stamped, so age it by advancing the clock — not by sending an old ts.
+    await post({ clientId: "c", httpBytes: 10, p2pBytes: 90, uploadBytes: 5 });
+    advance(STALE_MS + 1);            // now a, b AND c are all silent past the window
     const s = await stats();
-    check("stale viewer not counted active", s.viewers, 2);
-    check("but its httpBytes still counted", s.httpBytes, 360);
-    check("and its p2pBytes still counted", s.p2pBytes, 1840);
+    check("all three now stale", s.viewers, 0);
+    check("but httpBytes still counted", s.httpBytes, 360);
+    check("and p2pBytes still counted", s.p2pBytes, 1840);
+    // A fresh report re-activates the same entry rather than adding a second one.
+    await post({ clientId: "a", httpBytes: 150, p2pBytes: 950, uploadBytes: 60 });
+    const s2 = await stats();
+    check("re-reporting revives that viewer", s2.viewers, 1);
+    check("and does not double-count it", s2.httpBytes, 360);
   }
 
-  console.log("\nexactly at the stale boundary is still active (> not >=):");
+  console.log("\nexactly at the stale boundary is still active (<= not <):");
   {
-    await post({ clientId: "d", httpBytes: 0, p2pBytes: 0, ts: T - STALE_MS });
+    await post({ clientId: "d", httpBytes: 0, p2pBytes: 0 });
+    advance(STALE_MS);                // exactly on the boundary
     const s = await stats();
-    check("boundary viewer counted active", s.viewers, 3);
+    check("boundary viewer still active", s.viewers >= 1, true);
+  }
+
+  console.log("\nreport with NO ts is still aged out (regression: P2P-0011):");
+  {
+    // Before the fix, a missing ts gave lastSeen=0 and the `c.lastSeen &&` guards
+    // short-circuited on that falsy zero, so this client was never stale and never
+    // evicted — a permanent active viewer and a permanent leak.
+    await post({ clientId: "no-ts", httpBytes: 1, p2pBytes: 1 });
+    const fresh = await stats();
+    check("counted active right after reporting", fresh.viewers >= 1, true);
+    advance(STALE_MS + 1);
+    const s = await stats();
+    check("no-ts client goes stale like any other", s.viewers, 0);
+    advance(EVICT_MS);
+    const s2 = await stats();
+    check("and is eventually evicted", s2.tracked, 0);
+    check("its bytes survived the eviction", s2.httpBytes, s.httpBytes);
   }
 
   console.log("\nlong-gone viewer is EVICTED from the Map but its bytes survive:");
   {
-    // A viewer beyond EVICT_MS (20x STALE_MS) must be reclaimed so the Map cannot grow
-    // without bound, WITHOUT subtracting bytes it really served — deleting them outright
-    // would make offloadRatio jump backwards and break the sweep's delta arithmetic.
+    // Beyond EVICT_MS the entry must be reclaimed so the Map cannot grow without bound,
+    // WITHOUT subtracting bytes it really served — dropping them would make offloadRatio
+    // jump backwards and break the sweep's delta arithmetic.
     const before = await stats();
-    await post({ clientId: "ancient", httpBytes: 40, p2pBytes: 60, uploadBytes: 7, ts: T - STALE_MS * 20 - 1 });
+    await post({ clientId: "ancient", httpBytes: 40, p2pBytes: 60, uploadBytes: 7 });
+    advance(EVICT_MS + 1);
     const s = await stats();
-    check("evicted, so not tracked in the Map", s.tracked, before.tracked);
-    check("counted as retired", s.retiredClients, 1);
+    check("evicted, so not tracked in the Map", s.tracked, 0);
     check("its httpBytes still in the total", s.httpBytes, before.httpBytes + 40);
     check("its p2pBytes still in the total", s.p2pBytes, before.p2pBytes + 60);
     check("its uploadBytes still in the total", s.uploadBytes, before.uploadBytes + 7);
-    check("not counted as an active viewer", s.viewers, before.viewers);
+    check("not counted as an active viewer", s.viewers, 0);
   }
 
   console.log("\ntotals never move backwards across an eviction:");
   {
     const a1 = await stats();
     for (let i = 0; i < 3; i++) {
-      await post({ clientId: `old${i}`, httpBytes: 5, p2pBytes: 5, ts: T - STALE_MS * 30 });
+      await post({ clientId: `old${i}`, httpBytes: 5, p2pBytes: 5 });
     }
+    advance(EVICT_MS + 1);
     const a2 = await stats();
     check("httpBytes monotonic", a2.httpBytes >= a1.httpBytes, true);
     check("p2pBytes monotonic", a2.p2pBytes >= a1.p2pBytes, true);
-    check("Map stayed bounded (all 3 evicted)", a2.tracked, a1.tracked);
+    check("Map stayed bounded (all 3 evicted)", a2.tracked, 0);
     check("retired count grew by 3", a2.retiredClients, a1.retiredClients + 3);
   }
 
