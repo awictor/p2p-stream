@@ -129,6 +129,61 @@ const mkOffer = (id) => ({ offer_id: id, offer: { type: "offer", sdp: "v=0\r\no=
   b.ws.close();
   await new Promise((r) => tracker.close(r));
 
+  // Everything above drives a Server this test builds ITSELF, which means our actual
+  // server/tracker.js had zero coverage until iter 44 — including the config that once hung
+  // every announce. These assertions run against the REAL module.
+  console.log("\nthe REAL server/tracker.js module (previously untested):");
+  {
+    const mod = await import("../server/tracker.js");
+
+    // Importing must NOT bind ports. It used to: reaching `lanAddress()` started the tracker on
+    // :8000 and metrics on :8001 and the process never exited (measured exit 124), so the module
+    // was untestable and an import would have collided with a running dev stack.
+    //
+    // Asserting a literal `true` here would test NOTHING — my first version did exactly that, and
+    // deleting the isMain guard still passed. Probe the DEFAULT metrics port instead: if the
+    // import bound it, /stats answers on 8001.
+    let defaultPortBound = false;
+    try {
+      const r = await fetch("http://localhost:8001/stats", { signal: AbortSignal.timeout(1500) });
+      defaultPortBound = r.ok;
+    } catch { /* nothing listening — the guard held */ }
+    check("importing does NOT bind the default metrics port (isMain guard)", defaultPortBound, false);
+    check("lanAddress is exported", typeof mod.lanAddress, "function");
+    check("startTracker is exported", typeof mod.startTracker, "function");
+
+    // CONFIG GUARD. `filter` MUST stay absent — bittorrent-tracker's filter is async
+    // callback-style, and a boolean return silently hangs every announce with no response frame.
+    // That cost real debugging time once; this pins it.
+    const cfg = mod.TRACKER_CONFIG;
+    checkTruthy("TRACKER_CONFIG is exported", !!cfg);
+    check("filter is ABSENT (a boolean return hangs every announce)", "filter" in cfg, false);
+    check("ws transport enabled (browsers use only this)", cfg.ws, true);
+    check("udp disabled", cfg.udp, false);
+    check("http disabled", cfg.http, false);
+
+    // lanAddress must return something usable as a host in a URL — a second machine needs a
+    // routable address, and "localhost" would resolve to itself.
+    const lan = mod.lanAddress();
+    check("lanAddress returns a string", typeof lan, "string");
+    checkTruthy("and it is non-empty", lan.length > 0);
+    checkTruthy("either a bare IPv4 or the localhost fallback",
+      lan === "localhost" || /^\d{1,3}(\.\d{1,3}){3}$/.test(lan));
+    checkTruthy("never a CIDR or interface suffix (would break a URL)",
+      !lan.includes("/") && !lan.includes("%"));
+
+    // startTracker must be drivable on throwaway ports AND closeable, or it cannot be used in a
+    // test at all — the same lesson as startMetrics returning its server handle.
+    const { tracker: t2, metrics: m2 } = mod.startTracker(8321, 8322);
+    await sleep(500);
+    const stats = await fetch("http://localhost:8322/stats").then((r) => r.json());
+    checkTruthy("startTracker also starts the metrics server", typeof stats.offloadRatio === "number");
+    checkTruthy("on the port it was given", stats.viewers === 0);
+    m2.close();
+    await new Promise((r) => t2.close(r));
+    checkTruthy("both are closeable", true);
+  }
+
   console.log(`\n${failures === 0 ? "PASS" : "FAIL"}: ${failures} failing assertion(s)`);
   process.exit(failures === 0 ? 0 : 1);
 })().catch((e) => {
