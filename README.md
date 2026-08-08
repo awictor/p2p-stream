@@ -80,8 +80,8 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 456 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
-                          #                 ledger 37, claim 27, participation 35, forgery 29, sybil 29, origin 42
+npm test                  # 484 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
+                          #                 ledger 37, claim 55, participation 35, forgery 29, sybil 29, origin 42
 ```
 
 With the four services up:
@@ -169,6 +169,34 @@ runs the identical scenario twice — once normally, once with `?p2p=off` — an
 
 Origin egress fell by **51%**, not 68%, because the P2P arm fetched *more total bytes*. **Quote the
 control-arm subtraction, not the offload ratio.** The ratio is the flattering number.
+
+#### What that is worth in money — and when it is worth nothing (iter 55)
+
+A percentage is not a purchasing decision, so `verify:control` also prices the saving:
+
+```bash
+npm run verify:control                        # AWS CloudFront list price, $0.085/GB
+node test/verify-offload.js --control --rate cloudflare    # $0/GB
+node test/verify-offload.js --control --usdPerGB 0.12 --videoHours 200
+```
+
+Measured: **0.53 GB saved per video-hour → $0.05/video-hour → ~$33/month** at 730 video-hours
+(a 24/7 channel) on CloudFront list pricing. Every assumption is printed next to the figure,
+because the extrapolation — seconds of loopback video to a monthly bill — is where a number like
+this normally goes wrong. Rate sources (`--rate`): `cloudfront` $0.085, `fastly` $0.12, `gcs`
+$0.12, `cloudflare` **$0**. Also settable via `EGRESS_USD_PER_GB`.
+
+**`--rate cloudflare` prints that the saving is worth nothing**, in those words:
+
+```
+at $0.000/GB (cloudflare) the saving is worth NOTHING — a zero-egress CDN bills no transfer,
+so 0.44 GB saved per video-hour is $0. P2P buys you nothing here.
+```
+
+That case is asserted, not incidental. Cloudflare does not bill for egress, so on that CDN this
+entire product saves a platform **$0** — and a pricing feature that can only produce flattering
+numbers is marketing rather than measurement. The dollar figure also scales with participation:
+at 50% relaying the saving is 29%, so halve it.
 
 #### A second, independent instrument — and it measures a *different* quantity (iter 52)
 

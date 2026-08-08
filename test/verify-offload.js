@@ -107,6 +107,53 @@ const MAX_PEERS = (() => {
   return Number.isFinite(n) && n > 0 ? n : null;
 })();
 
+// Public egress list prices, USD per GB, first tier, as of 2025. These are REFERENCE POINTS for
+// the `--usdPerGB` flag, not a claim about what anyone pays: real bills are negotiated, tiered by
+// volume, and vary by region. Cloudflare is in the list deliberately — it charges nothing for
+// egress, so on that CDN this entire product saves $0, and a pricing feature that cannot express
+// that is marketing rather than measurement.
+export const EGRESS_RATES = {
+  cloudflare: 0,
+  cloudfront: 0.085,   // AWS CloudFront, first 10TB/mo, US/EU
+  fastly: 0.12,        // Fastly, North America on-demand
+  gcs: 0.12,           // Google Cloud CDN, first tier
+};
+const DEFAULT_RATE_NAME = "cloudfront";
+
+// --usdPerGB <n> (or EGRESS_USD_PER_GB, or --rate <name>) prices the measured origin saving.
+// Default is AWS CloudFront's first-tier list price, named in the output so nobody has to guess
+// where the number came from. 0 is a LEGAL value, not a missing one — Cloudflare charges nothing
+// for egress, and the feature has to be able to say "this saves you $0".
+const RATE_NAME = (() => {
+  const i = process.argv.indexOf("--rate");
+  const v = i !== -1 ? process.argv[i + 1] : process.env.EGRESS_RATE_NAME;
+  return v && Object.prototype.hasOwnProperty.call(EGRESS_RATES, v) ? v : null;
+})();
+const USD_PER_GB = (() => {
+  const i = process.argv.indexOf("--usdPerGB");
+  const raw = i !== -1 ? process.argv[i + 1] : process.env.EGRESS_USD_PER_GB;
+  if (raw !== undefined && raw !== null && raw !== "") {
+    const n = Number(raw);
+    // >= 0, not > 0: zero is meaningful here. Reject only unparseable/negative.
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return null;   // resolved against RATE_NAME / the default below
+})();
+// --videoHours <n>: how many video-hours/month to extrapolate over. No default is "right", so it
+// is echoed with every figure. 730 = a 24/7 channel for one month, which is at least a stated
+// assumption rather than a hidden one.
+const VIDEO_HOURS = (() => {
+  const i = process.argv.indexOf("--videoHours");
+  const raw = i !== -1 ? process.argv[i + 1] : process.env.EGRESS_VIDEO_HOURS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 730;
+})();
+// Precedence: an explicit --usdPerGB wins over --rate, which wins over the default. Resolved once
+// so the printed label always matches the number actually used — a mislabelled rate would be
+// worse than no rate at all.
+const EFF_USD_PER_GB = USD_PER_GB !== null ? USD_PER_GB : EGRESS_RATES[RATE_NAME || DEFAULT_RATE_NAME];
+const EFF_RATE_LABEL = USD_PER_GB !== null ? "custom rate" : (RATE_NAME || DEFAULT_RATE_NAME);
+
 // This package is "type":"module", so there is no bare `require` here. Playwright is a
 // CommonJS dep living OUTSIDE this repo, so build a require() bound to this file's URL.
 import { createRequire } from "module";
@@ -724,6 +771,63 @@ export function skewWarning(claim, offHeldS, onHeldS) {
   ];
 }
 
+/**
+ * Turn the measured origin saving into a $/month figure.
+ *
+ * Every input is explicit because the extrapolation is where a number like this normally goes
+ * wrong: we measure ~40 seconds of one stream on one box, and a monthly bill is a different
+ * quantity by many orders of magnitude. So this does NOT invent a viewer count or a schedule —
+ * it converts to a per-video-hour rate, then multiplies by `videoHoursPerMonth`, which the
+ * CALLER supplies and which is echoed alongside the result. A dollar figure whose assumptions
+ * are not printed next to it is unusable.
+ *
+ * `usdPerGB` of 0 must yield exactly 0 — see EGRESS_RATES.cloudflare.
+ * GB here is 1e9 bytes (decimal), which is how CDNs quote egress. Echoed so it is not a guess.
+ */
+export function priceSaving({ savedBytes, videoSeconds, usdPerGB, videoHoursPerMonth }) {
+  // A saving is only meaningful per unit of video delivered; raw bytes from a 40s run say nothing.
+  if (!(videoSeconds > 0)) return null;
+  if (!Number.isFinite(usdPerGB) || usdPerGB < 0) return null;
+  if (!Number.isFinite(videoHoursPerMonth) || videoHoursPerMonth <= 0) return null;
+  const GB = 1e9;
+  const savedGBPerVideoHour = (savedBytes / videoSeconds) * 3600 / GB;
+  return {
+    savedGBPerVideoHour,
+    usdPerVideoHour: savedGBPerVideoHour * usdPerGB,
+    usdPerMonth: savedGBPerVideoHour * usdPerGB * videoHoursPerMonth,
+    // Echoed so the figure can never be quoted without what produced it.
+    usdPerGB, videoHoursPerMonth, gbBytes: GB,
+  };
+}
+
+/**
+ * The $/month lines, as LINES so a test can assert what actually gets printed (same reason as
+ * skewWarning). Returns [] when the saving cannot be priced.
+ *
+ * Deliberately prints the ZERO case as its own sentence rather than "$0.00/month": on a
+ * zero-egress CDN the correct business answer is "this product saves you nothing", and burying
+ * that in a formatted number would be the flattering version.
+ */
+export function pricingLines(price, rateName) {
+  if (!price) return [];
+  const rate = `$${price.usdPerGB.toFixed(3)}/GB`;
+  const src = rateName ? ` (${rateName})` : "";
+  if (price.usdPerGB === 0) {
+    return [
+      `  at ${rate}${src} the saving is worth NOTHING — a zero-egress CDN bills no transfer,`,
+      `  so ${price.savedGBPerVideoHour.toFixed(2)} GB saved per video-hour is $0. P2P buys you nothing here.`,
+    ];
+  }
+  return [
+    `  = ${price.savedGBPerVideoHour.toFixed(2)} GB saved per video-hour` +
+      ` -> $${price.usdPerVideoHour.toFixed(2)}/video-hour at ${rate}${src}`,
+    `  = $${price.usdPerMonth.toFixed(0)}/month at ${price.videoHoursPerMonth} video-hours/month` +
+      ` (${(price.gbBytes / 1e9).toFixed(0)}e9 bytes = 1 GB, list price, real bills are negotiated)`,
+    `  ⚠ EXTRAPOLATED from a ${VIEWERS}-viewer loopback run of seconds, not a measured bill.` +
+      ` Scales with participation: see the decay table.`,
+  ];
+}
+
 export function claimNumbers(on, off) {
   if (!on || !off) return null;
   const originPerS = (a) => (a.heldS > 0 ? a.httpBytes / a.heldS : null);
@@ -1037,6 +1141,11 @@ async function runControl() {
     console.log(`  origin served ${mb(savedBytes)} less with P2P on (${mb(off.httpBytes)} -> ${mb(on.httpBytes)}),`);
     console.log(`  = -${savedPct}% per video-second (${(claim.offOriginPerS / 1e3).toFixed(0)} -> ${(claim.onOriginPerS / 1e3).toFixed(0)} KB/s of video).`);
     console.log(`  That subtraction — not the offload ratio — is the bill a platform stops paying.`);
+    // ...and in the unit the person paying the bill actually uses. Normalised per video-second
+    // first, then extrapolated with the assumptions printed alongside — never a bare dollar figure.
+    for (const line of pricingLines(priceSaving({
+      savedBytes, videoSeconds: on.heldS, usdPerGB: EFF_USD_PER_GB, videoHoursPerMonth: VIDEO_HOURS,
+    }), EFF_RATE_LABEL)) console.log(line);
     // If the arms obtained materially different amounts of video, the raw byte subtraction
     // credits P2P for video it never delivered. Say so rather than quietly publishing it.
     for (const line of skewWarning(claim, off.heldS, on.heldS)) console.log(line);

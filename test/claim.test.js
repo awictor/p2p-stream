@@ -17,7 +17,7 @@
  *
  * Usage: node test/claim.test.js     (exit 0 = pass, 1 = fail)
  */
-import { claimNumbers, skewWarning } from "./verify-offload.js";
+import { claimNumbers, skewWarning, priceSaving, pricingLines, EGRESS_RATES } from "./verify-offload.js";
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -131,6 +131,82 @@ console.log("\nthe skew WARNING must actually fire (iter 53) — arithmetic is n
   // No video at all -> videoSkewPct is null, not 0. Warning must not throw or fire on that.
   const none = claimNumbers({ httpBytes: 74.8e6, heldS: 0 }, { httpBytes: 151.6e6, heldS: 0 });
   check("a run with no video-seconds warns nothing (null, not 0)", skewWarning(none, 0, 0).length, 0);
+}
+
+console.log("\npriceSaving: the saving in the unit the payer uses (iter 55)");
+{
+  // The measured run: 76.8MB saved over 472 video-seconds. Everything else is derived, and the
+  // derivation is the risky part — a monthly bill is many orders of magnitude away from a 40s
+  // loopback run, so the extrapolation inputs must be explicit rather than assumed.
+  const p = priceSaving({ savedBytes: 76.8e6, videoSeconds: 472, usdPerGB: 0.085, videoHoursPerMonth: 730 });
+  // 76.8e6/472 = 162,711 B/s -> x3600 = 585.7 MB/video-hour -> 0.586 GB
+  check("GB saved per video-hour", +p.savedGBPerVideoHour.toFixed(3), 0.586);
+  check("$/video-hour at CloudFront list", +p.usdPerVideoHour.toFixed(4), 0.0498);
+  check("$/month over 730 video-hours", Math.round(p.usdPerMonth), 36);
+  // The inputs must come BACK OUT, so a printed figure can never be separated from its basis.
+  check("echoes the rate it used", p.usdPerGB, 0.085);
+  check("echoes the hours it assumed", p.videoHoursPerMonth, 730);
+  check("echoes decimal GB (CDNs bill 1e9, not 2^30)", p.gbBytes, 1e9);
+
+  // THE ASSERTION THAT KEEPS THIS HONEST: a zero-egress CDN must price to zero. Cloudflare
+  // charges nothing for transfer, so on that CDN this entire product saves $0. A pricing feature
+  // that cannot produce that answer is marketing.
+  const free = priceSaving({ savedBytes: 76.8e6, videoSeconds: 472, usdPerGB: 0, videoHoursPerMonth: 730 });
+  check("usdPerGB=0 -> $0/month, exactly", free.usdPerMonth, 0);
+  check("...and $0 per video-hour", free.usdPerVideoHour, 0);
+  check("but the GB saved is still reported (bytes moved regardless)",
+    +free.savedGBPerVideoHour.toFixed(3), 0.586);
+  check("EGRESS_RATES.cloudflare really is 0", EGRESS_RATES.cloudflare, 0);
+  checkTrue("and the default reference rate is non-zero, so the default is not vacuous",
+    EGRESS_RATES.cloudfront > 0);
+
+  // Scaling must be linear in both extrapolation inputs — if it is not, the figure is not a
+  // rate at all. Doubling the hours doubles the bill; doubling the price doubles the bill.
+  const double = priceSaving({ savedBytes: 76.8e6, videoSeconds: 472, usdPerGB: 0.085, videoHoursPerMonth: 1460 });
+  check("doubling video-hours doubles $/month", Math.round(double.usdPerMonth), Math.round(p.usdPerMonth * 2));
+  const pricier = priceSaving({ savedBytes: 76.8e6, videoSeconds: 472, usdPerGB: 0.17, videoHoursPerMonth: 730 });
+  check("doubling $/GB doubles $/month", Math.round(pricier.usdPerMonth), Math.round(p.usdPerMonth * 2));
+
+  // Garbage in must give null, NOT a plausible-looking number. A dollar figure derived from a run
+  // that obtained no video would be pure fabrication, and it is the case most likely to occur (a
+  // stalled arm reports heldS = 0).
+  check("no video-seconds -> null, not a fabricated $", priceSaving({ savedBytes: 76.8e6, videoSeconds: 0, usdPerGB: 0.085, videoHoursPerMonth: 730 }), null);
+  check("negative rate -> null", priceSaving({ savedBytes: 76.8e6, videoSeconds: 472, usdPerGB: -1, videoHoursPerMonth: 730 }), null);
+  check("non-numeric rate -> null", priceSaving({ savedBytes: 76.8e6, videoSeconds: 472, usdPerGB: NaN, videoHoursPerMonth: 730 }), null);
+  check("zero video-hours -> null (cannot extrapolate over nothing)", priceSaving({ savedBytes: 76.8e6, videoSeconds: 472, usdPerGB: 0.085, videoHoursPerMonth: 0 }), null);
+  // A NEGATIVE saving (P2P cost the origin MORE) must pass through as negative, not be clamped —
+  // same rule as claimNumbers: a regression has to be reportable.
+  const worse = priceSaving({ savedBytes: -10e6, videoSeconds: 472, usdPerGB: 0.085, videoHoursPerMonth: 730 });
+  checkTrue("a NEGATIVE saving prices negative, not clamped to 0", worse.usdPerMonth < 0,
+    "clamping would disguise a regression as break-even");
+}
+
+console.log("\npricingLines: what actually gets printed");
+{
+  const p = priceSaving({ savedBytes: 76.8e6, videoSeconds: 472, usdPerGB: 0.085, videoHoursPerMonth: 730 });
+  const lines = pricingLines(p, "cloudfront");
+  checkTrue("prints something", lines.length > 0);
+  checkTrue("names the rate it used", lines.some((l) => l.includes("$0.085/GB")));
+  checkTrue("names WHERE the rate came from", lines.some((l) => l.includes("cloudfront")));
+  checkTrue("states the video-hours assumption next to the figure",
+    lines.some((l) => l.includes("730")),
+    "a $/month with no stated period is unusable");
+  checkTrue("flags that it is EXTRAPOLATED, not a measured bill",
+    lines.some((l) => /EXTRAPOLAT/i.test(l)),
+    "a loopback run of seconds is not a monthly invoice");
+  checkTrue("says list prices are not real bills", lines.some((l) => /negotiated/.test(l)));
+
+  // The zero case gets its own wording. "$0.00/month" is technically correct and useless; the
+  // business answer is "this saves you nothing", and that has to be the sentence.
+  const zero = pricingLines(priceSaving({ savedBytes: 76.8e6, videoSeconds: 472, usdPerGB: 0, videoHoursPerMonth: 730 }), "cloudflare");
+  checkTrue("zero-rate output says the saving is worth nothing, in words",
+    zero.some((l) => /NOTHING|nothing/.test(l)),
+    "burying $0 in a formatted number is the flattering version");
+  checkTrue("and still names the zero-egress CDN", zero.some((l) => l.includes("cloudflare")));
+  checkTrue("zero output does NOT print a fake monthly total",
+    !zero.some((l) => /\/month/.test(l)));
+  // Unpriceable input must print nothing at all rather than a partial line.
+  check("null price -> no lines", pricingLines(null, "cloudfront").length, 0);
 }
 
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"}: ${failures} failing assertion(s)`);
