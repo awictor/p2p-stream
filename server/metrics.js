@@ -36,11 +36,42 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   // served and make offloadRatio jump backwards — which would also break the sweep's
   // delta arithmetic and contradict the published numbers. Session totals stay
   // monotonic; only the per-client bookkeeping is reclaimed.
-  const retired = { httpBytes: 0, p2pBytes: 0, uploadBytes: 0, count: 0 };
+  const retired = { httpBytes: 0, p2pBytes: 0, uploadBytes: 0, count: 0, attestedUploadBytes: 0 };
+
+  // RECEIVER-ATTESTED UPLOAD. `uploadBytes` above is what a viewer claims about ITSELF, which a
+  // modified client forges in one line — so the ad-free-for-relay tier cannot pay out on it.
+  // Instead, every viewer reports what its PEERS served IT (peerId -> bytes, learned from
+  // onSegmentLoaded), and we credit the server from those third-party reports.
+  //
+  // ⚠ THREAT MODEL. This defeats SOLO forgery: a peer inflating its own uploadBytes gains no
+  // attested credit, because credit only arrives from other viewers. It does NOT defeat
+  // COLLUSION — one browser can open N tabs that attest for each other, and peer identity here
+  // is a self-chosen engine id with no proof of work or possession behind it. Closing that needs
+  // authenticated peer identity at the tracker, which is out of scope. Attested totals are a
+  // CROSS-CHECK, not an authorisation to pay.
+  //
+  // Keyed by the ATTESTING client so reports stay idempotent: each viewer's latest snapshot
+  // replaces its previous one, exactly like the byte counters. Summing raw POSTs instead would
+  // multiply every credit by the report interval.
+  const attestations = new Map();  // attestingClientId -> { byPeer: {peerId: bytes}, lastSeen }
+  // peerId -> clientId, so an attested credit can be attributed to a tracked viewer. Viewers
+  // announce their own engine peerId; without this the server sees two unrelated namespaces.
+  const peerToClient = new Map();
 
   app.post("/metrics", (req, res) => {
-    const { clientId, httpBytes = 0, p2pBytes = 0, uploadBytes = 0, ts } = req.body || {};
+    const { clientId, httpBytes = 0, p2pBytes = 0, uploadBytes = 0, ts, peerId, attest } = req.body || {};
     if (!clientId) return res.status(400).json({ error: "clientId required" });
+    // Self-declared mapping. Fine for a cross-check — a peer that lies here mis-credits itself,
+    // and cannot mint bytes that no receiver reported.
+    if (typeof peerId === "string" && peerId) peerToClient.set(peerId, clientId);
+    if (attest && typeof attest === "object") {
+      const byPeer = {};
+      for (const [pid, bytes] of Object.entries(attest)) {
+        const n = Number(bytes);
+        if (typeof pid === "string" && pid && Number.isFinite(n) && n > 0) byPeer[pid] = n;
+      }
+      attestations.set(clientId, { byPeer, lastSeen: now() });
+    }
     // Recency is stamped SERVER-SIDE, not taken from the client. Trusting `ts` meant a
     // report without one got lastSeen=0, and the `c.lastSeen &&` guards below then
     // short-circuited on that falsy zero — so such a client was never stale, never
@@ -86,15 +117,43 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
       upload += c.uploadBytes;
       if (t - c.lastSeen <= STALE_MS) active += 1;
     }
+
+    // Fold attestations into per-peer credit. Evict alongside the byte counters so a long run
+    // cannot grow the Map without bound, keeping the retired total monotonic for the same reason.
+    for (const [id, a] of attestations) {
+      if (t - a.lastSeen > EVICT_MS) {
+        for (const bytes of Object.values(a.byPeer)) retired.attestedUploadBytes += bytes;
+        attestations.delete(id);
+      }
+    }
+    // A viewer NEVER attests for itself — self-attestation is exactly the forgery this exists to
+    // detect, so it is dropped rather than counted.
+    const attestedByClient = {};
+    let attestedTotal = retired.attestedUploadBytes;
+    for (const [attestingId, a] of attestations) {
+      for (const [pid, bytes] of Object.entries(a.byPeer)) {
+        const servedBy = peerToClient.get(pid);
+        if (servedBy && servedBy === attestingId) continue;   // self-attestation, ignored
+        attestedTotal += bytes;
+        const key = servedBy || `unmapped:${pid}`;
+        attestedByClient[key] = (attestedByClient[key] || 0) + bytes;
+      }
+    }
+
     const total = http + p2p;
     return {
       viewers: active,
       httpBytes: http,          // bytes pulled from origin across the swarm
       p2pBytes: p2p,            // bytes pulled peer-to-peer across the swarm
-      uploadBytes: upload,      // bytes served to peers across the swarm
+      uploadBytes: upload,      // bytes served to peers across the swarm (SELF-REPORTED)
       offloadRatio: total ? p2p / total : 0, // <- the number the whole MVP exists to show
       tracked: clients.size,    // live entries in the Map (bounded — see EVICT_MS)
       retiredClients: retired.count,
+      // Third-party view of the same bytes: what RECEIVERS say each peer served them. Compare
+      // against uploadBytes — a large one-sided gap means someone is misreporting.
+      attestedUploadBytes: attestedTotal,
+      attestedByClient,
+      attestingClients: attestations.size,
     };
   }
 

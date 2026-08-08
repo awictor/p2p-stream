@@ -59,6 +59,17 @@
     const uploadCapBytes = cfg.uploadCapMB ? cfg.uploadCapMB * 1e6 : null;
     let uploadCapped = false;
 
+    // peerId -> bytes THAT PEER SERVED US. Cumulative, reported to the metrics server so a
+    // peer's upload can be credited by its receivers instead of by its own claim.
+    const servedByPeer = Object.create(null);
+
+    // Our own engine peer id, so the server can join attested credit to this viewer. Verified
+    // reachable at `engine.core.peerId` (probed live — it is not on the engine itself, and
+    // there is no public getter, so read it defensively and tolerate null).
+    const ownPeerId = () => {
+      try { return window.__hls.p2pEngine.core.peerId || null; } catch { return null; }
+    };
+
     // Per-segment fetch ledger, to attribute the total-byte gap between P2P on and off.
     // `fetches` counts delivery EVENTS; `seen` holds one entry per distinct segment URL.
     // If fetches > seen, some segment was delivered more than once — and `dupBytes` is how
@@ -232,7 +243,14 @@
             // Each loaded segment tells us where its bytes came from.
             eng.addEventListener("onSegmentLoaded", (d) => {
               const len = d.bytesLength || d.byteLength || 0;
-              if (d.downloadSource === "p2p") p2pBytes += len;
+              if (d.downloadSource === "p2p") {
+                p2pBytes += len;
+                // RECEIVER ATTESTATION: record who served us and how much. This is a
+                // third-party witness to their upload, which is the only version of the
+                // number a reward tier could act on — a peer's claim about itself is
+                // forgeable in one line. See the threat note in server/metrics.js.
+                if (d.peerId) servedByPeer[d.peerId] = (servedByPeer[d.peerId] || 0) + len;
+              }
               else httpBytes += len; // "http" (origin) or anything non-p2p
               // Per-segment ledger. With P2P on, 4 viewers fetched 1.52x the bytes the
               // HTTP-only arm needed for the SAME video and the SAME buffer depth, and the
@@ -360,7 +378,13 @@
         headers: { "Content-Type": "application/json" },
         // Date.now() is fine in the browser; the tracker/metrics server never runs
         // inside a workflow sandbox, so no restriction here.
-        body: JSON.stringify({ clientId, httpBytes, p2pBytes, uploadBytes, ts: Date.now() }),
+        // `peerId` lets the server map an attested credit onto a tracked viewer — the engine's
+        // peer id and our clientId are otherwise unrelated namespaces. `attest` is our
+        // third-party witness of what OTHER peers served us.
+        body: JSON.stringify({
+          clientId, httpBytes, p2pBytes, uploadBytes, ts: Date.now(),
+          peerId: ownPeerId(), attest: servedByPeer,
+        }),
       }).catch(() => {});
     }, cfg.reportIntervalMs);
   </script>

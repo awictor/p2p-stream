@@ -80,7 +80,7 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 239 assertions: metrics 37, tracker 15, config 57, dashboard 24, start 16,
+npm test                  # 251 assertions: metrics 49, tracker 15, config 57, dashboard 24, start 16,
                           #                 ledger 37, claim 19, participation 35
 ```
 
@@ -199,6 +199,30 @@ because consent needs a visible number and a visible stop.
 > defend the platform against a dishonest one. Any ad-free-for-relay reward built on this number
 > needs proof-of-delivery attested by the **receiving** peer — self-reported upload totals are
 > free money for a scripted client.
+
+### Receiver-attested upload: don't pay out on a peer's own claim (iter 39)
+
+The reward tier can't be built on `uploadBytes`, because that is a peer's claim about itself. So
+every viewer now also reports **what its peers served it** — `onSegmentLoaded` hands the receiver
+`{peerId, bytesLength}` — and `/stats` credits a peer from those third-party reports:
+
+| | 4-viewer run |
+|---|---|
+| self-reported upload | 116.8MB |
+| **receiver-attested upload** | **113.5MB** |
+| attested ÷ self-reported | **0.972** |
+| viewers credited by peers | 4 of 4 (0 unmapped) |
+
+A peer that inflates its own `uploadBytes` gains **no** attested credit — unit-tested by pushing a
+self-claim to 999,999,999 bytes and watching attested credit stay put. Self-attestation is dropped
+outright, since that is precisely the forgery being detected (mutation-tested: removing that guard
+lets a viewer self-credit 501,000 bytes).
+
+> **⚠ Attestation defeats SOLO forgery, not COLLUSION.** Peer identity here is a self-chosen engine
+> id with nothing behind it, so one browser can open N tabs that attest for each other, and a
+> `peerId → clientId` mapping is self-declared. Treat attested totals as a **cross-check**, not an
+> authorisation to pay. Closing the collusion gap needs authenticated peer identity at the tracker,
+> which this MVP does not have.
 
 > Windows longer than the stream itself (here 180s) are indistinguishable from the default —
 > every segment is eligible either way. The harness now says so instead of printing them as

@@ -26,6 +26,11 @@ function checkClose(name, actual, expected, eps = 1e-9) {
   if (!ok) failures++;
   console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}${ok ? "" : ` — got ${actual}, want ${expected}`}`);
 }
+function checkTrue(name, actual) {
+  const ok = actual === true;
+  if (!ok) failures++;
+  console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}${ok ? "" : " — got falsy"}`);
+}
 
 const post = (body) =>
   fetch(`${BASE}/metrics`, {
@@ -190,6 +195,54 @@ const advance = (ms) => { clock += ms; };
     check("httpBytes not NaN", Number.isFinite(s.httpBytes), true);
     check("httpBytes ignores garbage", s.httpBytes, 100);
     checkClose("offloadRatio still correct", s.offloadRatio, 0.75);
+  }
+
+  console.log("\nRECEIVER-ATTESTED upload: credit comes from peers, not from self-claims:");
+  {
+    const p = Number(process.env.METRICS_TEST_PORT4 || 8126);
+    startMetrics(p);
+    await new Promise((r) => setTimeout(r, 400));
+    const b = `http://localhost:${p}`;
+    const post = (body) => fetch(`${b}/metrics`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    // Two viewers: A serves, B receives and attests for A.
+    await post({ clientId: "A", peerId: "peer-A", uploadBytes: 1000, p2pBytes: 0 });
+    await post({ clientId: "B", peerId: "peer-B", p2pBytes: 1000, attest: { "peer-A": 1000 } });
+    let s = await fetch(`${b}/stats`).then((r) => r.json());
+    check("A is credited from B's report", s.attestedByClient.A, 1000);
+    check("attested total matches", s.attestedUploadBytes, 1000);
+    check("self-reported upload still reported separately", s.uploadBytes, 1000);
+    check("one attesting client", s.attestingClients, 1);
+
+    // THE POINT: a peer inflating its OWN uploadBytes gains no attested credit.
+    await post({ clientId: "A", peerId: "peer-A", uploadBytes: 999999999, p2pBytes: 0 });
+    s = await fetch(`${b}/stats`).then((r) => r.json());
+    check("self-inflation does NOT move attested credit", s.attestedByClient.A, 1000);
+    checkTrue("and the gap between the two is now large",
+      s.uploadBytes - s.attestedUploadBytes > 1e8);
+
+    // SELF-ATTESTATION must be dropped — that is exactly the forgery being detected.
+    await post({ clientId: "A", peerId: "peer-A", uploadBytes: 0, attest: { "peer-A": 500000 } });
+    s = await fetch(`${b}/stats`).then((r) => r.json());
+    check("a viewer cannot attest for itself", s.attestedByClient.A, 1000);
+
+    // Reports are cumulative snapshots, so a repeat must REPLACE, not accumulate.
+    await post({ clientId: "B", peerId: "peer-B", p2pBytes: 1500, attest: { "peer-A": 1500 } });
+    s = await fetch(`${b}/stats`).then((r) => r.json());
+    check("repeat attestation replaces rather than sums", s.attestedByClient.A, 1500);
+
+    // An unmapped peerId is still counted, but flagged rather than silently attributed.
+    await post({ clientId: "C", peerId: "peer-C", p2pBytes: 700, attest: { "peer-ghost": 700 } });
+    s = await fetch(`${b}/stats`).then((r) => r.json());
+    check("unmapped peer is labelled", s.attestedByClient["unmapped:peer-ghost"], 700);
+    check("and included in the total", s.attestedUploadBytes, 2200);
+
+    // Garbage must not poison the totals.
+    await post({ clientId: "D", peerId: "peer-D", attest: { "peer-A": "abc", "": 5, "peer-X": -3 } });
+    s = await fetch(`${b}/stats`).then((r) => r.json());
+    checkTrue("attested total stays finite", Number.isFinite(s.attestedUploadBytes));
+    check("garbage attestations ignored", s.attestedUploadBytes, 2200);
   }
 
   console.log(`\n${failures === 0 ? "PASS" : "FAIL"}: ${failures} failing assertion(s)`);
