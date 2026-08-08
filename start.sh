@@ -189,4 +189,33 @@ cat <<EOF
 
 EOF
 
+# TWO-MACHINE URLS. The localhost block above is correct for a single box and WRONG for a
+# cross-machine run: the swarm is identified by hash(streamUrl), so a viewer on `localhost` and one
+# on the LAN IP derive different stream URLs, land in DIFFERENT swarms, and sit at 0 peers with no
+# error at all. Following the banner as printed is therefore the fastest way to a silent failure.
+# Print the address a second machine must actually dial, and say the rule out loud.
+LAN=$(node -e "
+  const os = require('os');
+  const n = Object.values(os.networkInterfaces()).flat()
+    .find((x) => x && x.family === 'IPv4' && !x.internal);
+  process.stdout.write(n ? n.address : '');
+" 2>/dev/null || echo "")
+if [ -n "$LAN" ]; then
+  cat <<EOF
+  ACROSS TWO MACHINES — use this address on EVERY viewer, including this one:
+
+    Viewer      http://$LAN:5173
+    Dashboard   http://$LAN:8001
+
+  ⚠ Do NOT mix localhost with $LAN. The swarm id includes the stream URL, so mixing them
+    puts viewers in separate swarms: 0 peers, 0% offload, and no error message.
+    Windows Firewall may prompt on first run — allow Node and nginx on the private network.
+  ------------------------------------------------------------
+
+EOF
+else
+  echo "  (no non-internal IPv4 found, so no LAN address to advertise — single-box only.)"
+  echo ""
+fi
+
 wait

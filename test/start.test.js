@@ -136,6 +136,28 @@ try {
       /-s stop/.test(SRC));
     checkTrue("the runtime probe file is removed on exit", /rm -f "\$ROOT\/\.probe\.mjs"/.test(SRC));
   }
+  console.log("\ntwo-machine banner: the launcher must advertise the LAN address (iter 45)");
+  {
+    // The localhost block is correct for one box and WRONG across machines: the swarm id includes
+    // hash(streamUrl), so a localhost viewer and a LAN-IP viewer land in DIFFERENT swarms and sit
+    // at 0 peers with NO error. Following the banner as printed was therefore the fastest route to
+    // a silent failure, which is exactly the kind of thing a stranger hits first.
+    checkTrue("detects a LAN address", /networkInterfaces/.test(SRC) && /LAN=\$\(node -e/.test(SRC));
+    checkTrue("skips internal interfaces (loopback is useless to a second machine)",
+      /!x\.internal/.test(SRC));
+    checkTrue("prints the viewer URL on that address", /http:\/\/\$LAN:5173/.test(SRC));
+    checkTrue("prints the dashboard URL too", /http:\/\/\$LAN:8001/.test(SRC));
+    checkTrue("states the do-NOT-mix rule, since mixing fails silently",
+      /Do NOT mix localhost/.test(SRC),
+      "the failure mode is 0 peers with no error, so the warning has to be explicit");
+    checkTrue("mentions the firewall prompt that otherwise filters every port",
+      /Firewall/i.test(SRC));
+    // A machine with no non-internal IPv4 must say so rather than printing `http://:5173`.
+    checkTrue("handles having no LAN address instead of emitting a broken URL",
+      /no non-internal IPv4 found/.test(SRC),
+      "an empty $LAN would render http://:5173");
+    checkTrue("and guards it with a non-empty test", /if \[ -n "\$LAN" \]/.test(SRC));
+  }
 } finally {
   try { unlinkSync(probePath); } catch { /* already gone */ }
 }

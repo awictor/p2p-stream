@@ -80,7 +80,7 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 330 assertions: metrics 55, tracker 30, config 57, dashboard 24, start 16,
+npm test                  # 338 assertions: metrics 55, tracker 30, config 57, dashboard 24, start 24,
                           #                 ledger 37, claim 19, participation 35, forgery 29, sybil 29
 ```
 
@@ -334,15 +334,20 @@ two-machine run is the next credibility step; see [Running across two machines](
 
 ## Running across two machines
 
-On the host, start all four services and note the LAN address the tracker prints:
+On the host, one command. It waits for the playlist to actually fill, then prints the LAN address
+every viewer must use:
 
 ```bash
-npm run origin:loop &   # wait ~180s for the 90-fragment playlist to fill
-npm run nginx & npm run tracker & npm run web &
-# [tracker] reachable from LAN at ws://192.168.68.66:8000
+npm start
+```
+```
+  ACROSS TWO MACHINES — use this address on EVERY viewer, including this one:
+
+    Viewer      http://192.168.68.66:5173
+    Dashboard   http://192.168.68.66:8001
 ```
 
-Then open **`http://<LAN_IP>:5173`** on every viewer — **including the host machine itself**.
+Open that **`http://<LAN_IP>:5173`** on every viewer — **including the host machine itself**.
 
 > ⚠️ **Never mix `localhost` with the LAN IP.** The swarm is identified by
 > `${version}-${swarmId}-${hash(streamUrl)}`, so the stream URL is part of the swarm identity.
