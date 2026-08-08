@@ -54,8 +54,13 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   // replaces its previous one, exactly like the byte counters. Summing raw POSTs instead would
   // multiply every credit by the report interval.
   const attestations = new Map();  // attestingClientId -> { byPeer: {peerId: bytes}, lastSeen }
-  // peerId -> clientId, so an attested credit can be attributed to a tracked viewer. Viewers
-  // announce their own engine peerId; without this the server sees two unrelated namespaces.
+  // peerId -> { clientId, lastSeen }, so an attested credit can be attributed to a tracked
+  // viewer. Viewers announce their own engine peerId; without this the server sees two unrelated
+  // namespaces. `lastSeen` exists because this Map MUST be evictable: peerIds are minted fresh
+  // per page load, so a busy dashboard would otherwise accumulate one entry per viewer forever
+  // (measured: 200 viewers evicted from `clients`, all 200 mappings retained). Keeping stale
+  // mappings is also a correctness bug, not only a leak — credit for a long-departed peerId was
+  // still being attributed to its evicted client.
   const peerToClient = new Map();
 
   app.post("/metrics", (req, res) => {
@@ -63,7 +68,7 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
     if (!clientId) return res.status(400).json({ error: "clientId required" });
     // Self-declared mapping. Fine for a cross-check — a peer that lies here mis-credits itself,
     // and cannot mint bytes that no receiver reported.
-    if (typeof peerId === "string" && peerId) peerToClient.set(peerId, clientId);
+    if (typeof peerId === "string" && peerId) peerToClient.set(peerId, { clientId, lastSeen: now() });
     if (attest && typeof attest === "object") {
       const byPeer = {};
       for (const [pid, bytes] of Object.entries(attest)) {
@@ -126,13 +131,21 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
         attestations.delete(id);
       }
     }
+    // Evict stale peerId mappings on the same clock. Without this the Map is unbounded AND
+    // credit keeps resolving to clients that left long ago; an attacker who learns a retired
+    // peerId could aim credit at a viewer that no longer exists. After eviction such a credit
+    // degrades to `unmapped:` — visible and unattributed, which is the honest outcome.
+    for (const [pid, m] of peerToClient) {
+      if (t - m.lastSeen > EVICT_MS) peerToClient.delete(pid);
+    }
     // A viewer NEVER attests for itself — self-attestation is exactly the forgery this exists to
     // detect, so it is dropped rather than counted.
     const attestedByClient = {};
     let attestedTotal = retired.attestedUploadBytes;
     for (const [attestingId, a] of attestations) {
       for (const [pid, bytes] of Object.entries(a.byPeer)) {
-        const servedBy = peerToClient.get(pid);
+        const m = peerToClient.get(pid);
+        const servedBy = m && m.clientId;
         if (servedBy && servedBy === attestingId) continue;   // self-attestation, ignored
         attestedTotal += bytes;
         const key = servedBy || `unmapped:${pid}`;
@@ -154,6 +167,9 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
       attestedUploadBytes: attestedTotal,
       attestedByClient,
       attestingClients: attestations.size,
+      // Exposed so the bound is OBSERVABLE. An unbounded Map with no counter stays invisible
+      // until it is a production problem; `tracked` earned its place the same way.
+      trackedPeerIds: peerToClient.size,
     };
   }
 

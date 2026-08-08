@@ -80,7 +80,7 @@ npm run web                    # 4) viewer      http://localhost:5173
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 251 assertions: metrics 49, tracker 15, config 57, dashboard 24, start 16,
+npm test                  # 257 assertions: metrics 55, tracker 15, config 57, dashboard 24, start 16,
                           #                 ledger 37, claim 19, participation 35
 ```
 

@@ -245,6 +245,46 @@ const advance = (ms) => { clock += ms; };
     check("garbage attestations ignored", s.attestedUploadBytes, 2200);
   }
 
+  console.log("\npeerId mappings are BOUNDED and stale ones stop resolving (iter 40 defects):");
+  {
+    // Two real bugs found by reading the attestation code: `peerToClient` had set/get but no
+    // delete, so (a) it grew forever and (b) credit kept resolving to clients that had already
+    // been evicted — an attacker who learned a retired peerId could aim credit at a departed
+    // viewer. Both are regression-guarded here.
+    let t = 1000;
+    const p = Number(process.env.METRICS_TEST_PORT5 || 8127);
+    startMetrics(p, { now: () => t });
+    await new Promise((r) => setTimeout(r, 400));
+    const b = `http://localhost:${p}`;
+    const post = (body) => fetch(`${b}/metrics`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const stats = () => fetch(`${b}/stats`).then((r) => r.json());
+
+    for (let i = 0; i < 25; i++) await post({ clientId: `c${i}`, peerId: `peer-${i}`, uploadBytes: 10 });
+    let s = await stats();
+    check("all 25 peerIds tracked while fresh", s.trackedPeerIds, 25);
+
+    // Everyone leaves and time passes well beyond the evict window.
+    t += EVICT_MS * 2;
+    s = await stats();
+    check("clients evicted", s.tracked, 0);
+    check("peerId mappings evicted too, so the Map is BOUNDED", s.trackedPeerIds, 0);
+
+    // A fresh viewer attesting for a long-gone peerId must NOT credit the departed client.
+    await post({ clientId: "fresh", peerId: "peer-fresh", p2pBytes: 5, attest: { "peer-7": 999 } });
+    s = await stats();
+    check("credit for a departed peerId is NOT attributed to its old client",
+      s.attestedByClient.c7, undefined);
+    check("it degrades to unmapped, which is visible and honest",
+      s.attestedByClient["unmapped:peer-7"], 999);
+    // A live mapping must still resolve — the fix must not break the normal path.
+    await post({ clientId: "srv", peerId: "peer-srv", uploadBytes: 100 });
+    await post({ clientId: "rcv", peerId: "peer-rcv", p2pBytes: 50, attest: { "peer-srv": 50 } });
+    s = await stats();
+    check("a live peerId still credits its client", s.attestedByClient.srv, 50);
+  }
+
   console.log(`\n${failures === 0 ? "PASS" : "FAIL"}: ${failures} failing assertion(s)`);
   process.exit(failures === 0 ? 0 : 1);
 })().catch((e) => {
