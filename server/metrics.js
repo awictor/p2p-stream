@@ -58,9 +58,24 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   //   THREAT NOTE: this bounds MEMORY. It does NOT authenticate a peer or stop a determined
   //   attacker from churning the Map (evicting honest viewers by flooding fake ones) — that needs
   //   authenticated identity at the tracker, which is out of scope and tracked in roadmap.md.
-  const MAX_CLIENTS = Number(process.env.MAX_CLIENTS || 5000);
-  const MAX_ATTEST_KEYS = Number(process.env.MAX_ATTEST_KEYS || 256);
-  const MAX_CLIENTID_LEN = Number(process.env.MAX_CLIENTID_LEN || 128);
+  // A misconfigured limit is a SILENT footgun, not a crash: `Number("5oo")` is NaN, and
+  // `clients.size > NaN` is always false, so a typo'd MAX_CLIENTS disables the ceiling entirely and
+  // the DoS this bound exists to stop comes back with no signal. `0` or a negative is the opposite
+  // failure — it evicts every client and /stats is permanently empty. So a limit env is only
+  // honoured when it parses to a positive integer; anything else falls back to the default and warns.
+  function posIntEnv(name, dflt) {
+    const raw = process.env[name];
+    if (raw === undefined || raw === "") return dflt;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n <= 0) {
+      console.warn(`[metrics] ignoring ${name}=${JSON.stringify(raw)} (not a positive integer); using ${dflt}`);
+      return dflt;
+    }
+    return n;
+  }
+  const MAX_CLIENTS = posIntEnv("MAX_CLIENTS", 5000);
+  const MAX_ATTEST_KEYS = posIntEnv("MAX_ATTEST_KEYS", 256);
+  const MAX_CLIENTID_LEN = posIntEnv("MAX_CLIENTID_LEN", 128);
   // Per-report byte ceiling. A cumulative counter for one viewer over one session cannot plausibly
   // exceed this; default 1TB is orders of magnitude above any real live session yet finite. It
   // exists because `Number(x) || 0` (the old coercion) let NEGATIVES and absurd magnitudes through
@@ -69,7 +84,20 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   //   THREAT NOTE: this bounds the VALUE RANGE of a reported counter. It does NOT authenticate the
   //   reporter — an honest-looking peer can still lie WITHIN range. It stops the published number
   //   (offloadRatio) from being driven impossible/negative by a single malformed report.
-  const MAX_REPORT_BYTES = Number(process.env.MAX_REPORT_BYTES || 1e12);
+  // Same footgun as the count limits, one field over: a typo'd MAX_REPORT_BYTES -> NaN, and
+  // `n > NaN` is false in sanitizeBytes, so the byte clamp silently disappears and the P2P-0063
+  // poison (offloadRatio > 1) returns. Byte ceilings can be non-integer, so validate finite-positive
+  // rather than integer, but fall back + warn on garbage exactly the same way.
+  const MAX_REPORT_BYTES = (() => {
+    const raw = process.env.MAX_REPORT_BYTES;
+    if (raw === undefined || raw === "") return 1e12;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) {
+      console.warn(`[metrics] ignoring MAX_REPORT_BYTES=${JSON.stringify(raw)} (not a positive number); using 1e12`);
+      return 1e12;
+    }
+    return n;
+  })();
 
   // Coerce a client-supplied byte field to a finite value in [0, MAX_REPORT_BYTES]. Anything
   // non-numeric, NaN, Infinity, negative, or absurdly large collapses to a safe number rather than
