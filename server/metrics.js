@@ -61,6 +61,25 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   const MAX_CLIENTS = Number(process.env.MAX_CLIENTS || 5000);
   const MAX_ATTEST_KEYS = Number(process.env.MAX_ATTEST_KEYS || 256);
   const MAX_CLIENTID_LEN = Number(process.env.MAX_CLIENTID_LEN || 128);
+  // Per-report byte ceiling. A cumulative counter for one viewer over one session cannot plausibly
+  // exceed this; default 1TB is orders of magnitude above any real live session yet finite. It
+  // exists because `Number(x) || 0` (the old coercion) let NEGATIVES and absurd magnitudes through
+  // — `|| 0` only catches NaN. PROVEN: one POST of p2pBytes:-1e12 drove offloadRatio to
+  // 1.0000000001 (a ratio cannot exceed 1) and folded a negative into `retired` PERMANENTLY.
+  //   THREAT NOTE: this bounds the VALUE RANGE of a reported counter. It does NOT authenticate the
+  //   reporter — an honest-looking peer can still lie WITHIN range. It stops the published number
+  //   (offloadRatio) from being driven impossible/negative by a single malformed report.
+  const MAX_REPORT_BYTES = Number(process.env.MAX_REPORT_BYTES || 1e12);
+
+  // Coerce a client-supplied byte field to a finite value in [0, MAX_REPORT_BYTES]. Anything
+  // non-numeric, NaN, Infinity, negative, or absurdly large collapses to a safe number rather than
+  // poisoning a cumulative total. Clamp (not reject) so an honest report that merely overshoots the
+  // ceiling still counts its bytes up to the bound instead of vanishing.
+  function sanitizeBytes(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return n > MAX_REPORT_BYTES ? MAX_REPORT_BYTES : n;
+  }
 
   // Fold a departing client's cumulative bytes into `retired` so session totals stay MONOTONIC —
   // reports are cumulative snapshots, so simply dropping an entry would subtract bytes that really
@@ -130,8 +149,11 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
         // peerId keys and inflate `attestations` without limit. Take the first MAX_ATTEST_KEYS
         // valid entries; a viewer relaying to more peers than that in one interval is not real.
         if (kept >= MAX_ATTEST_KEYS) break;
-        const n = Number(bytes);
-        if (typeof pid === "string" && pid && Number.isFinite(n) && n > 0) { byPeer[pid] = n; kept += 1; }
+        // Same range clamp as the self-reported counters: an attested credit is a byte figure too,
+        // so a negative or absurd value here would poison attestedUploadBytes exactly as it poisons
+        // p2pBytes. sanitizeBytes returns 0 for junk; skip zero so a bogus key adds no phantom peer.
+        const n = sanitizeBytes(bytes);
+        if (typeof pid === "string" && pid && n > 0) { byPeer[pid] = n; kept += 1; }
       }
       attestations.set(clientId, { byPeer, lastSeen: now() });
     }
@@ -146,9 +168,9 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
     // manufacture the cross-network result `verify:remote` exists to certify.
     const fp = hostFingerprint(req.socket?.remoteAddress || req.ip || "");
     clients.set(clientId, {
-      httpBytes: Number(httpBytes) || 0,
-      p2pBytes: Number(p2pBytes) || 0,
-      uploadBytes: Number(uploadBytes) || 0,
+      httpBytes: sanitizeBytes(httpBytes),
+      p2pBytes: sanitizeBytes(p2pBytes),
+      uploadBytes: sanitizeBytes(uploadBytes),
       lastSeen: now(),
       clientTs: Number(ts) || null,
       host: fp?.host || null,
