@@ -50,6 +50,29 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   // so a later report updates in place instead of double-counting.
   const EVICT_MS = STALE_MS * 20; // 5 minutes
 
+  // HARD ceilings on client-controlled state. POST /metrics is public and unauthenticated (viewers
+  // report from a different origin), and until iter 75 the ONLY bound on resident state was time
+  // (EVICT_MS). A flood of unique clientIds inside one window grew `clients` without limit — a
+  // memory-exhaustion DoS on the one server a real audience depends on. These are COUNT bounds, so
+  // a burst is capped regardless of how fast it arrives.
+  //   THREAT NOTE: this bounds MEMORY. It does NOT authenticate a peer or stop a determined
+  //   attacker from churning the Map (evicting honest viewers by flooding fake ones) — that needs
+  //   authenticated identity at the tracker, which is out of scope and tracked in roadmap.md.
+  const MAX_CLIENTS = Number(process.env.MAX_CLIENTS || 5000);
+  const MAX_ATTEST_KEYS = Number(process.env.MAX_ATTEST_KEYS || 256);
+  const MAX_CLIENTID_LEN = Number(process.env.MAX_CLIENTID_LEN || 128);
+
+  // Fold a departing client's cumulative bytes into `retired` so session totals stay MONOTONIC —
+  // reports are cumulative snapshots, so simply dropping an entry would subtract bytes that really
+  // were served and make offloadRatio jump backwards. Used by BOTH the time-based eviction in
+  // aggregate() and the count-based ceiling below, so the two can never disagree about accounting.
+  function retire(c) {
+    retired.httpBytes += c.httpBytes;
+    retired.p2pBytes += c.p2pBytes;
+    retired.uploadBytes += c.uploadBytes;
+    retired.count += 1;
+  }
+
   // K-of-N attestation filter (see the aggregation below). Overridable so a deployment can tighten
   // it and so tests can pin behaviour at both sides of the boundary.
   // MIN_ATTESTERS=2 is the weakest useful setting: it kills a lone forged voucher while still
@@ -91,16 +114,24 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   const peerToClient = new Map();
 
   app.post("/metrics", (req, res) => {
-    const { clientId, httpBytes = 0, p2pBytes = 0, uploadBytes = 0, ts, peerId, attest } = req.body || {};
-    if (!clientId) return res.status(400).json({ error: "clientId required" });
+    const { clientId: rawClientId, httpBytes = 0, p2pBytes = 0, uploadBytes = 0, ts, peerId, attest } = req.body || {};
+    if (!rawClientId || typeof rawClientId !== "string") return res.status(400).json({ error: "clientId required" });
+    // Clamp the clientId LENGTH before it is used as a Map key. An unbounded string is both a
+    // memory vector and a way to bloat every /stats response that echoes per-client data.
+    const clientId = rawClientId.slice(0, MAX_CLIENTID_LEN);
     // Self-declared mapping. Fine for a cross-check — a peer that lies here mis-credits itself,
     // and cannot mint bytes that no receiver reported.
     if (typeof peerId === "string" && peerId) peerToClient.set(peerId, { clientId, lastSeen: now() });
     if (attest && typeof attest === "object") {
       const byPeer = {};
+      let kept = 0;
       for (const [pid, bytes] of Object.entries(attest)) {
+        // CAP the number of attested peers per report. One POST could otherwise carry thousands of
+        // peerId keys and inflate `attestations` without limit. Take the first MAX_ATTEST_KEYS
+        // valid entries; a viewer relaying to more peers than that in one interval is not real.
+        if (kept >= MAX_ATTEST_KEYS) break;
         const n = Number(bytes);
-        if (typeof pid === "string" && pid && Number.isFinite(n) && n > 0) byPeer[pid] = n;
+        if (typeof pid === "string" && pid && Number.isFinite(n) && n > 0) { byPeer[pid] = n; kept += 1; }
       }
       attestations.set(clientId, { byPeer, lastSeen: now() });
     }
@@ -123,6 +154,20 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
       host: fp?.host || null,
       loopback: fp?.loopback ?? null,
     });
+    // Enforce the COUNT ceiling right here, not only in aggregate() — a flood of POSTs with no
+    // interleaved /stats read would otherwise never trigger the time-based sweep and could grow the
+    // Map unbounded between reads. Updating an EXISTING clientId does not grow the Map, so this only
+    // bites on genuinely new ids. Evict oldest-by-lastSeen (the closest to timing out anyway),
+    // folding bytes into `retired` so totals stay monotonic exactly like time eviction.
+    while (clients.size > MAX_CLIENTS) {
+      let oldestId = null, oldestSeen = Infinity;
+      for (const [id, c] of clients) {
+        if (c.lastSeen < oldestSeen) { oldestSeen = c.lastSeen; oldestId = id; }
+      }
+      if (oldestId === null) break;
+      retire(clients.get(oldestId));
+      clients.delete(oldestId);
+    }
     res.json({ ok: true });
   });
 
@@ -139,10 +184,7 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
     // `retired` so the totals below are unchanged by the eviction itself.
     for (const [id, c] of clients) {
       if (t - c.lastSeen > EVICT_MS) {
-        retired.httpBytes += c.httpBytes;
-        retired.p2pBytes += c.p2pBytes;
-        retired.uploadBytes += c.uploadBytes;
-        retired.count += 1;
+        retire(c);
         clients.delete(id);
       }
     }
@@ -232,7 +274,7 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
       p2pBytes: p2p,            // bytes pulled peer-to-peer across the swarm
       uploadBytes: upload,      // bytes served to peers across the swarm (SELF-REPORTED)
       offloadRatio: total ? p2p / total : 0, // <- the number the whole MVP exists to show
-      tracked: clients.size,    // live entries in the Map (bounded — see EVICT_MS)
+      tracked: clients.size,    // live entries in the Map (bounded by MAX_CLIENTS AND EVICT_MS)
       retiredClients: retired.count,
       // Third-party view of the same bytes: what RECEIVERS say each peer served them. Compare
       // against uploadBytes — a large one-sided gap means someone is misreporting.
@@ -253,6 +295,9 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
       // Exposed so the bound is OBSERVABLE. An unbounded Map with no counter stays invisible
       // until it is a production problem; `tracked` earned its place the same way.
       trackedPeerIds: peerToClient.size,
+      // The hard ceiling, exposed so `tracked` can be read against its bound. `tracked` at
+      // maxClients is the signal that eviction-under-pressure is active, not that all is calm.
+      maxClients: MAX_CLIENTS,
       // WHERE the active viewers are reporting from, as counts only — never addresses. This is
       // what lets `verify:remote` refuse to certify a loopback run wearing a LAN URL: with
       // distinctHosts === 1 every "viewer" is one machine's tabs, whatever URL they typed.
