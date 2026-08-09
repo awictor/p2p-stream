@@ -12,7 +12,7 @@
     "origin:loop": "bash origin/segment.sh loop origin/sample.mp4",
     "origin:rtmp": "bash origin/segment.sh rtmp",
     "nginx": "bash origin/run-nginx.sh",
-    "test": "node scripts/check-configs.mjs && node test/metrics.test.js && node test/tracker.test.js && node test/config.test.js && node test/dashboard.test.js && node test/start.test.js && node test/ledger.test.js && node test/claim.test.js && node test/participation.test.js && node test/forgery.test.js && node test/sybil.test.js && node test/segment.test.js && node test/origin.test.js && node test/viewer.test.js && node test/spread.test.js && node test/deploy.test.js && node test/verdict.test.js && node test/compose.test.js",
+    "test": "node scripts/check-configs.mjs && node test/metrics.test.js && node test/tracker.test.js && node test/config.test.js && node test/dashboard.test.js && node test/start.test.js && node test/ledger.test.js && node test/claim.test.js && node test/participation.test.js && node test/forgery.test.js && node test/sybil.test.js && node test/segment.test.js && node test/origin.test.js && node test/viewer.test.js && node test/spread.test.js && node test/deploy.test.js && node test/verdict.test.js && node test/compose.test.js && node test/checkconfigs.test.js",
     "test:metrics": "node test/metrics.test.js",
     "test:tracker": "node test/tracker.test.js",
     "test:config": "node test/config.test.js",
@@ -35,7 +35,8 @@
     "test:deploy": "node test/deploy.test.js",
     "test:verdict": "node test/verdict.test.js",
     "test:compose": "node test/compose.test.js",
-    "check:configs": "node scripts/check-configs.mjs"
+    "check:configs": "node scripts/check-configs.mjs",
+    "test:checkconfigs": "node test/checkconfigs.test.js"
   },
   "dependencies": {
     "bittorrent-tracker": "^11.2.1",
