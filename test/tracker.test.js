@@ -158,7 +158,21 @@ const mkOffer = (id) => ({ offer_id: id, offer: { type: "offer", sdp: "v=0\r\no=
     const cfg = mod.TRACKER_CONFIG;
     checkTruthy("TRACKER_CONFIG is exported", !!cfg);
     check("filter is ABSENT (a boolean return hangs every announce)", "filter" in cfg, false);
-    check("ws transport enabled (browsers use only this)", cfg.ws, true);
+    // ws is now an OBJECT, not the boolean `true` — options must reach `new WebSocketServer(...)`.
+    // It stays ENABLED because bittorrent-tracker starts the WS transport unless `ws === false`,
+    // and an object is truthy. Asserting `cfg.ws === true` (the old check) would forbid the very
+    // shape that carries the payload cap.
+    checkTruthy("ws transport enabled (browsers use only this)", cfg.ws !== false && !!cfg.ws);
+    check("ws is an object so options reach the WebSocketServer", typeof cfg.ws, "object");
+    // THE FIX (P2P-0062). The WS default maxPayload is 100MB; on a public unauthenticated signaling
+    // socket that is a single-frame memory/bandwidth DoS. Signaling frames (SDP + ICE) are a few KB,
+    // so the cap must be small and finite — present, a number, > 0, and well under the 100MB default.
+    check("ws.maxPayload is set (not the 100MB library default)", typeof cfg.ws.maxPayload, "number");
+    checkTruthy("ws.maxPayload is a positive bound", cfg.ws.maxPayload > 0);
+    checkTruthy("ws.maxPayload is far below the 100MB default (<= 1MB)",
+      cfg.ws.maxPayload <= 1024 * 1024);
+    checkTruthy("ws.maxPayload is generous enough for real SDP+ICE (>= 8KB)",
+      cfg.ws.maxPayload >= 8 * 1024);
     check("udp disabled", cfg.udp, false);
     check("http disabled", cfg.http, false);
 
@@ -179,6 +193,27 @@ const mkOffer = (id) => ({ offer_id: id, offer: { type: "offer", sdp: "v=0\r\no=
     const stats = await fetch("http://localhost:8322/stats").then((r) => r.json());
     checkTruthy("startTracker also starts the metrics server", typeof stats.offloadRatio === "number");
     checkTruthy("on the port it was given", stats.viewers === 0);
+
+    // BEHAVIORAL PROOF the cap does not break signaling: a real peer must still announce and get a
+    // response through the REAL TRACKER_CONFIG (object-form ws with maxPayload), not the boolean
+    // `true` the self-built Server above uses. A normal announce is a few hundred bytes, far under
+    // the cap, so it must sail through — if the object form had disabled the WS transport, this
+    // hangs and fails.
+    const realAnnounce = await new Promise((resolve) => {
+      const ws = new WebSocket("ws://localhost:8321");
+      const got = [];
+      ws.on("message", (m) => { try { got.push(JSON.parse(m.toString())); } catch { /* ignore */ } });
+      ws.on("error", () => resolve(null));
+      ws.on("open", () => ws.send(JSON.stringify({
+        action: "announce", info_hash: INFO_HASH, peer_id: PEER_A,
+        numwant: 1, uploaded: 0, downloaded: 0, left: 0, event: "started",
+        offers: [mkOffer("capped1")],
+      })));
+      setTimeout(() => { try { ws.close(); } catch { /* ignore */ } resolve(got); }, 900);
+    });
+    checkTruthy("a real peer still announces through the capped ws transport",
+      Array.isArray(realAnnounce) && realAnnounce.some((m) => m.action === "announce"));
+
     m2.close();
     await new Promise((r) => t2.close(r));
     checkTruthy("both are closeable", true);

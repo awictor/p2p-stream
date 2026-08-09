@@ -27,10 +27,22 @@ export function lanAddress() {
 // This config is not cosmetic: a boolean-returning `filter` once hung every announce with no
 // response frame at all, and re-enabling `udp`/`http` would expose transports browsers never use.
 // It had zero coverage until iter 44 because the only tracker test builds its own Server.
+// Signaling frames are small: a WebRTC SDP offer/answer plus ICE candidates is a few KB. But this
+// WS server is PUBLIC and UNAUTHENTICATED, and bittorrent-tracker spreads `ws` straight into
+// `new WebSocketServer({...})`, whose `maxPayload` DEFAULTS TO 100MB. That default let a peer (or a
+// script hitting the open port) ship 100MB frames at peer discovery — an unbounded-client-input
+// memory/bandwidth DoS on the one server the whole swarm depends on, the same class as the
+// unbounded metrics Map fixed in P2P-0061. 64KB is ~10x the largest real signaling message.
+//   THREAT NOTE: this bounds FRAME SIZE. It does NOT authenticate the signaling peer, and does not
+//   stop a flood of small valid frames — that needs authenticated identity at the tracker, out of
+//   scope (roadmap.md). It closes the single-giant-frame vector, not identity.
+const WS_MAX_PAYLOAD = Number(process.env.WS_MAX_PAYLOAD || 64 * 1024); // 64KB
 export const TRACKER_CONFIG = {
   udp: false,
   http: false,
-  ws: true,          // only the WebSocket transport (that's what browsers/WebRTC use)
+  // Object form (not the boolean `true`) so options reach `new WebSocketServer(...)`. Still enabled
+  // — an object is truthy, and bittorrent-tracker starts the WS transport unless `ws === false`.
+  ws: { maxPayload: WS_MAX_PAYLOAD },
   stats: false,
   // NB: filter is async callback-style `(infoHash, params, cb)` — you MUST call
   // cb() to allow (or cb(err) to reject). Returning a boolean silently hangs every
