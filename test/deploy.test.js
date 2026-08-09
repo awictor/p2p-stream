@@ -159,9 +159,17 @@ console.log("\ndeploy/README.md documents what the config cannot enforce");
     "mixing https and LAN-IP URLs silently splits the swarm");
   checkTrue("states which ports must be open (80/443 only)", /\b80 and 443\b/.test(doc));
   // HARD RULE 2: an unrun config must not read as verified.
-  checkTrue("admits the config has NOT been validated or served traffic",
-    /not.{0,40}(validated|been run)|unrun/i.test(doc),
+  // Assert the SUBSTANCE, not one phrasing. Iter 65 replaced the prose caveat with a
+  // verified/unverified table, and the old regex (`not (validated|been run)|unrun`) stopped
+  // matching even though the doc still admitted the gap twice — a test pinned to wording rather
+  // than meaning fails on a documentation improvement. What must be true: the doc says the
+  // Caddyfile is unverified AND says why (no caddy binary / no other parser).
+  checkTrue("admits the Caddyfile is NOT validated or served",
+    /(not .{0,40}(validated|been run|served)|unrun|only Caddyfile parser|never served)/i.test(doc),
     "no caddy binary was available, so claiming it works would be unearned");
+  checkTrue("...and names the reason (no caddy binary / no library)",
+    /no caddy binary|no library|only .{0,20}parser/i.test(doc),
+    "an unexplained gap reads as an oversight rather than a tool limitation");
   checkTrue("says secrets come from env, not the repo", /secret/i.test(doc) && /\$P2P_HOST/.test(doc));
 }
 

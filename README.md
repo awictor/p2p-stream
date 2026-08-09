@@ -93,8 +93,8 @@ The file **does parse** — `npm run check:configs` runs a real YAML parse of it
 line and column rather than after 600 assertions.
 
 > ⚠ Still unproven: `docker compose config` has not been run, so the compose **schema** (image tags,
-> key names) is unvalidated — that needs a docker binary. Parse + structure are checked; whether the
-> images pull and run is an unchecked box in `.p2p-loop/manual-qa.md`.
+> key names) is unvalidated — that needs a docker binary. Parse + structure are checked. Full
+> verified/unverified table: [deploy/README.md](deploy/README.md#exactly-what-is-and-is-not-verified).
 
 ### Off localhost you need HTTPS + WSS — there is a config for it
 
@@ -113,17 +113,18 @@ One https origin, path-routed (`/` viewer, `/hls/*` origin, `/tracker` signaling
 ports, open the viewer with the override params it already supports — `deploy/README.md` has the
 copy-paste line and the full routing table.
 
-> ⚠ The Caddyfile has **not** been run through `caddy validate` or served real traffic (no caddy
-> binary where it was written). `npm run test:deploy` asserts the routing invariants that fail
-> *silently* — a wrong `/tracker` route reads as "peers never connect", not as an error — but the
-> syntax itself is unverified.
+> ⚠ The Caddyfile has **not** been run through `caddy validate` or served real traffic — **`caddy
+> validate` is the only Caddyfile parser and there is no library**, so `check:configs` reports SKIP
+> until caddy is on PATH. `npm run test:deploy` asserts the routing invariants that fail *silently*
+> instead — a wrong `/tracker` route reads as "peers never connect", not as an error. Full
+> verified/unverified table: [deploy/README.md](deploy/README.md#exactly-what-is-and-is-not-verified).
 
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 670 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
+npm test                  # 671 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
                           #                 ledger 37, claim 55, participation 35, forgery 29, sybil 29, origin 42,
-                          #                 viewer 27, spread 43, deploy 31, verdict 32, compose 26, checkconfigs 27
+                          #                 viewer 27, spread 43, deploy 32, verdict 32, compose 26, checkconfigs 27
                           # ...plus check:configs (5 checks: real YAML parse + nginx -t), which runs FIRST
 ```
 

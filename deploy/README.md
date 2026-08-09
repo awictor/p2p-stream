@@ -62,11 +62,24 @@ machine running the stack.
 The hostname comes from `$P2P_HOST`. TLS keys are generated and stored by Caddy outside this
 repository. Nothing in `deploy/` contains a credential and nothing should — this repo is public.
 
-## Not yet verified
+## Exactly what is and is not verified
 
-`deploy/Caddyfile` has **not** been run through `caddy validate` or served real traffic — no caddy
-binary is available in the environment that wrote it. `test/deploy.test.js` asserts the routing
-invariants (every backend port is proxied exactly once, prefixes stripped only where the backend
-expects it, no secrets, websocket route present), which catches the mistakes that are silent —
-a wrong `/tracker` route presents as "peers never connect", not as an HTTP error. But the syntax
-itself is unrun; see the unchecked boxes in `.p2p-loop/manual-qa.md`.
+`npm run check:configs` runs before the test suite and parses every config it can. This table is the
+single place that tracks the gaps, so they cannot quietly multiply — **the standing rule is that a
+new config file gets a parser wired into `scripts/check-configs.mjs` in the same change that adds
+it.** Two exemptions exist today and both are tool availability, not choice:
+
+| config | syntax | semantics / runtime |
+|---|---|---|
+| `origin/nginx.conf` | ✅ `nginx -t` (vendored binary in `bin/`) | ✅ same check validates directives |
+| `docker-compose.yml` | ✅ real YAML parse, plus ports/volumes structure | ❌ `docker compose config` needs docker — image tags and key names unchecked |
+| `deploy/Caddyfile` | ❌ **`caddy validate` is the only Caddyfile parser and there is no library** | ❌ never served traffic |
+
+For the Caddyfile, `test/deploy.test.js` asserts the routing invariants instead — every backend port
+proxied exactly once, prefixes stripped only where the backend expects it, no secrets, the websocket
+route present. That covers the mistakes that fail *silently*: a wrong `/tracker` route presents as
+"peers never connect", not as an HTTP error. It does not and cannot cover syntax.
+
+`check:configs` picks the Caddyfile up automatically once `caddy` is on PATH — the check is already
+written and reports SKIP with its reason until then. The user-run steps are the unchecked boxes in
+`.p2p-loop/manual-qa.md`.
