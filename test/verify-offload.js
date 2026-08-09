@@ -568,6 +568,10 @@ async function runOnce({ viewers = VIEWERS, watchS = WATCH_S, staggerS = STAGGER
       // Cost side, carried out so --control can tabulate the two arms against each other.
       p2p, stalls: totalStalls, stallS: +totalStallS.toFixed(1), avgLatency: avgLat,
       upPerViewer, ledger, heldS, bytesPerVideoS,
+      // Per-viewer spread, carried on the summary rather than only printed. It was computed here
+      // and discarded, so --control could not put it in a machine-readable row — the same
+      // "collected then aggregated away" shape as the per-viewer data itself (iter 57).
+      spread: viewerSpread(qoe),
       // The window the ENGINE reported, not what we asked for — so the sweep table cannot
       // claim a value that never applied.
       p2pWindow: effWindow,
@@ -959,6 +963,56 @@ export function viewerSpreadLines(spread) {
   return out;
 }
 
+/**
+ * The control arm as ONE machine-readable row (P2P-0056).
+ *
+ * WHY THIS AND NOT A `--json` MODE. `--control` produces every number this project quotes
+ * externally — the -51% origin saving, the $/month figure, the per-viewer spread — and printed
+ * only prose, so two runs could not be diffed. The three SWEEPS already emit `csv:` blocks; I
+ * declined a harness-wide "--json output" four times on the false premise that nothing did.
+ * Checking that premise shrank the work to this function.
+ *
+ * Built from the SAME objects the prose prints (`claimNumbers`, `priceSaving`, the summaries'
+ * `spread`), so the row and the paragraph above it cannot disagree — which is the failure mode
+ * that matters for a number people quote.
+ *
+ * Empty cell, never "undefined" or "null": a missing value in CSV is an empty field, and a
+ * literal "undefined" in a spreadsheet column silently poisons any average taken over it.
+ */
+export const CONTROL_CSV_HEADER = [
+  "viewers", "saved_pct", "offload_pct_on", "kb_per_video_s_on", "kb_per_video_s_off",
+  "origin_bytes_on", "origin_bytes_off", "video_s_on", "video_s_off", "video_skew_pct",
+  "usd_per_gb", "usd_per_month", "spread_pct", "worst_over_mean", "stalls_on", "stalls_off",
+].join(",");
+
+export function controlCsvRow({ on, off, claim, price, usdPerGB }) {
+  if (!on || !off) return null;
+  // A cell is empty when the value is genuinely absent. `0` is NOT absent — a $0/month saving on
+  // a zero-egress CDN is a real measurement and must survive into the row (iter 55).
+  const cell = (v) => (v === null || v === undefined || Number.isNaN(v) ? "" : String(v));
+  const kb = (v) => (typeof v === "number" && Number.isFinite(v) ? Math.round(v / 1e3) : null);
+  const r2 = (v) => (typeof v === "number" && Number.isFinite(v) ? +v.toFixed(2) : null);
+  const sp = on.spread || null;
+  return [
+    cell(on.viewers),
+    cell(claim ? claim.savedPct : null),
+    cell(on.offloadPct),
+    cell(kb(on.bytesPerVideoS)),
+    cell(kb(off.bytesPerVideoS)),
+    cell(on.httpBytes),
+    cell(off.httpBytes),
+    cell(typeof on.heldS === "number" ? Math.round(on.heldS) : null),
+    cell(typeof off.heldS === "number" ? Math.round(off.heldS) : null),
+    cell(claim ? claim.videoSkewPct : null),
+    cell(usdPerGB),
+    cell(price ? r2(price.usdPerMonth) : null),
+    cell(sp ? sp.spreadPct : null),
+    cell(sp ? r2(sp.maxOverMean) : null),
+    cell(on.stalls),
+    cell(off.stalls),
+  ].join(",");
+}
+
 export function claimNumbers(on, off) {
   if (!on || !off) return null;
   const originPerS = (a) => (a.heldS > 0 ? a.httpBytes / a.heldS : null);
@@ -1285,6 +1339,20 @@ async function runControl() {
       console.log(`  because the P2P arm fetched more total bytes. Quote -${savedPct}%, not ${on.offloadPct}%.`);
     }
   }
+
+  // ONE MACHINE-READABLE ROW. Everything above is prose; this is the same run in a form two
+  // invocations can be diffed in. Built from the objects already printed, so the row cannot
+  // disagree with the paragraphs. Makes "is -51% stable?" answerable by running control twice.
+  console.log("\ncsv:");
+  console.log(CONTROL_CSV_HEADER);
+  console.log(controlCsvRow({
+    on, off, claim,
+    price: priceSaving({
+      savedBytes: claim ? claim.savedBytes : 0, videoSeconds: on.heldS,
+      usdPerGB: EFF_USD_PER_GB, videoHoursPerMonth: VIDEO_HOURS,
+    }),
+    usdPerGB: EFF_USD_PER_GB,
+  }));
 
   // ATTRIBUTE the total-byte gap. This is the whole point of the segment ledger: the same byte
   // total can come from a duplicate fetch, a double-counted event, or genuinely more distinct

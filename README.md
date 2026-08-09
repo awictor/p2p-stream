@@ -122,8 +122,8 @@ copy-paste line and the full routing table.
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 671 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
-                          #                 ledger 37, claim 55, participation 35, forgery 29, sybil 29, origin 42,
+npm test                  # 691 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
+                          #                 ledger 37, claim 75, participation 35, forgery 29, sybil 29, origin 42,
                           #                 viewer 27, spread 43, deploy 32, verdict 32, compose 26, checkconfigs 27
                           # ...plus check:configs (5 checks: real YAML parse + nginx -t), which runs FIRST
 ```
@@ -213,6 +213,25 @@ runs the identical scenario twice — once normally, once with `?p2p=off` — an
 
 Origin egress fell by **51%**, not 68%, because the P2P arm fetched *more total bytes*. **Quote the
 control-arm subtraction, not the offload ratio.** The ratio is the flattering number.
+
+#### The control arm also emits one CSV row, so two runs can be diffed (iter 67)
+
+```
+viewers,saved_pct,offload_pct_on,kb_per_video_s_on,kb_per_video_s_off,origin_bytes_on,...
+4,47,68,540,321,74127817,139274832,434,434,0,0.085,33.55,15,1.08,0,0
+```
+
+Built from the same objects the prose above it prints, so the row and the paragraph cannot disagree.
+Empty cells for genuinely missing values — never the string `undefined`, which would poison any
+average taken over the column. A `0` is *not* missing: `usd_per_month=0` on a zero-egress CDN is a
+real measurement and survives into the row.
+
+**A finding from using it: two `--control` runs at identical settings produced byte-identical rows.**
+Not a frozen output — dropping `--watch 35` to `20` changes every figure (`saved_pct` 47 → 38). It is
+real determinism, because a VOD fixture replays the same file with the same segment count and the same
+stagger every time. So **this loopback setup cannot answer "is −51% stable?"** — the variance that
+question is about (RTT, packet loss, uplink contention) does not exist here. That box stays `(gated)`
+on the two-machine run, now for a measured reason rather than a cost estimate.
 
 #### What that is worth in money — and when it is worth nothing (iter 55)
 

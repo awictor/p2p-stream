@@ -17,7 +17,8 @@
  *
  * Usage: node test/claim.test.js     (exit 0 = pass, 1 = fail)
  */
-import { claimNumbers, skewWarning, priceSaving, pricingLines, EGRESS_RATES } from "./verify-offload.js";
+import { claimNumbers, skewWarning, priceSaving, pricingLines, EGRESS_RATES,
+  CONTROL_CSV_HEADER, controlCsvRow } from "./verify-offload.js";
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -207,6 +208,76 @@ console.log("\npricingLines: what actually gets printed");
     !zero.some((l) => /\/month/.test(l)));
   // Unpriceable input must print nothing at all rather than a partial line.
   check("null price -> no lines", pricingLines(null, "cloudfront").length, 0);
+}
+
+console.log("\ncontrolCsvRow: the control arm in a form two runs can be DIFFED (iter 67)");
+{
+  // The measured iter-31 run, as --control sees it.
+  const on = {
+    viewers: 4, offloadPct: 68, bytesPerVideoS: 494e3, httpBytes: 74.8e6, heldS: 472.4,
+    stalls: 0, spread: { spreadPct: 21, maxOverMean: 1.107 },
+  };
+  const off = { bytesPerVideoS: 320e3, httpBytes: 151.6e6, heldS: 472.4, stalls: 0 };
+  const claim = claimNumbers(on, off);
+  const price = priceSaving({
+    savedBytes: claim.savedBytes, videoSeconds: on.heldS, usdPerGB: 0.085, videoHoursPerMonth: 730,
+  });
+  const row = controlCsvRow({ on, off, claim, price, usdPerGB: 0.085 });
+
+  // A header/row width mismatch silently shifts every column, so a spreadsheet reads
+  // usd_per_month out of the spread_pct cell. This is the assertion that matters most.
+  const cols = CONTROL_CSV_HEADER.split(",");
+  check("header and row have the same width", row.split(",").length, cols.length);
+  checkTrue("and that width is > 10 (a truncated header would trivially match)", cols.length > 10);
+
+  // The row must carry the SAME numbers the prose prints — that is the point of building it from
+  // the same objects rather than re-deriving.
+  const val = (name) => row.split(",")[cols.indexOf(name)];
+  check("saved_pct matches claimNumbers", val("saved_pct"), String(claim.savedPct));
+  check("...and is the published 51", val("saved_pct"), "51");
+  check("offload_pct_on is the RATIO, kept distinct from the saving", val("offload_pct_on"), "68");
+  checkTrue("the two differ, which is the whole point of the control arm",
+    val("saved_pct") !== val("offload_pct_on"),
+    "if these ever match, someone has conflated the ratio with the bill reduction");
+  check("usd_per_month matches priceSaving", val("usd_per_month"), String(+price.usdPerMonth.toFixed(2)));
+  check("spread_pct comes from the summary's spread", val("spread_pct"), "21");
+  check("worst_over_mean is rounded to 2dp", val("worst_over_mean"), "1.11");
+  check("kb per video-second, both arms", `${val("kb_per_video_s_on")}/${val("kb_per_video_s_off")}`, "494/320");
+
+  // EMPTY CELL, never the string "undefined". A literal "undefined" in a numeric column poisons
+  // any average taken over it, and it is what a naive template interpolation produces.
+  const noPrice = controlCsvRow({ on, off, claim, price: null, usdPerGB: null });
+  check("a null price leaves the cell EMPTY", noPrice.split(",")[cols.indexOf("usd_per_month")], "");
+  checkTrue("no 'undefined' anywhere in the row", !/undefined/.test(noPrice),
+    "a literal undefined in a numeric column silently breaks any aggregate over it");
+  checkTrue("no 'null' anywhere either", !/(^|,)null(,|$)/.test(noPrice));
+  // Width must survive missing values, or the empty cells shift the remaining columns.
+  check("width is unchanged with nulls", noPrice.split(",").length, cols.length);
+
+  // ZERO IS NOT ABSENT. $0/month on a zero-egress CDN is a real measurement (iter 55) and must
+  // reach the row, not be blanked as "missing".
+  const freePrice = priceSaving({
+    savedBytes: claim.savedBytes, videoSeconds: on.heldS, usdPerGB: 0, videoHoursPerMonth: 730,
+  });
+  const freeRow = controlCsvRow({ on, off, claim, price: freePrice, usdPerGB: 0 });
+  check("usd_per_month of 0 is written as 0, not blank", freeRow.split(",")[cols.indexOf("usd_per_month")], "0");
+  check("usd_per_gb of 0 likewise", freeRow.split(",")[cols.indexOf("usd_per_gb")], "0");
+
+  // A run with no spread computed (single viewer, or the field absent) must still emit a full row.
+  const noSpread = controlCsvRow({ on: { ...on, spread: null }, off, claim, price, usdPerGB: 0.085 });
+  check("a missing spread leaves empty cells, not a short row", noSpread.split(",").length, cols.length);
+  check("...spread_pct empty", noSpread.split(",")[cols.indexOf("spread_pct")], "");
+
+  // Degenerate: no arms at all -> null, so the caller prints nothing rather than a header with
+  // a bogus row under it.
+  check("a missing arm returns null", controlCsvRow({ on: null, off, claim, price, usdPerGB: 0.085 }), null);
+  // A NEGATIVE saving (P2P cost the origin more) must pass through — same rule as claimNumbers.
+  const worse = claimNumbers({ httpBytes: 150e6, heldS: 100 }, { httpBytes: 100e6, heldS: 100 });
+  const worseRow = controlCsvRow({
+    on: { ...on, httpBytes: 150e6, heldS: 100 }, off: { ...off, httpBytes: 100e6, heldS: 100 },
+    claim: worse, price: null, usdPerGB: 0.085,
+  });
+  check("a negative saving is written as negative", worseRow.split(",")[cols.indexOf("saved_pct")], "-50");
 }
 
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"}: ${failures} failing assertion(s)`);
