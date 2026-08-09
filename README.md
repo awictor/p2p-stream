@@ -122,9 +122,9 @@ copy-paste line and the full routing table.
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 691 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
+npm test                  # 712 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
                           #                 ledger 37, claim 75, participation 35, forgery 29, sybil 29, origin 42,
-                          #                 viewer 27, spread 43, deploy 32, verdict 32, compose 26, checkconfigs 27
+                          #                 viewer 27, spread 43, deploy 32, verdict 32, compose 26, checkconfigs 27, runnginx 21
                           # ...plus check:configs (5 checks: real YAML parse + nginx -t), which runs FIRST
 ```
 
