@@ -13,7 +13,7 @@
     "origin:loop": "bash origin/segment.sh loop origin/sample.mp4",
     "origin:rtmp": "bash origin/segment.sh rtmp",
     "nginx": "bash origin/run-nginx.sh",
-    "test": "node scripts/check-configs.mjs && node test/metrics.test.js && node test/tracker.test.js && node test/config.test.js && node test/dashboard.test.js && node test/start.test.js && node test/ledger.test.js && node test/claim.test.js && node test/participation.test.js && node test/forgery.test.js && node test/sybil.test.js && node test/segment.test.js && node test/origin.test.js && node test/viewer.test.js && node test/spread.test.js && node test/deploy.test.js && node test/verdict.test.js && node test/compose.test.js && node test/checkconfigs.test.js && node test/runnginx.test.js && node test/remote.test.js && node test/twomachine.test.js && node test/hostcount.test.js && node test/ceiling.test.js && node test/sanitize.test.js && node test/license.test.js && node test/envlimits.test.js",
+    "test": "node scripts/check-configs.mjs && node test/metrics.test.js && node test/tracker.test.js && node test/config.test.js && node test/dashboard.test.js && node test/start.test.js && node test/ledger.test.js && node test/claim.test.js && node test/participation.test.js && node test/forgery.test.js && node test/sybil.test.js && node test/segment.test.js && node test/origin.test.js && node test/viewer.test.js && node test/spread.test.js && node test/deploy.test.js && node test/verdict.test.js && node test/compose.test.js && node test/checkconfigs.test.js && node test/runnginx.test.js && node test/remote.test.js && node test/twomachine.test.js && node test/hostcount.test.js && node test/ceiling.test.js && node test/sanitize.test.js && node test/license.test.js && node test/envlimits.test.js && node test/security-doc.test.js",
     "test:metrics": "node test/metrics.test.js",
     "test:tracker": "node test/tracker.test.js",
     "test:config": "node test/config.test.js",
@@ -46,7 +46,8 @@
     "test:ceiling": "node test/ceiling.test.js",
     "test:sanitize": "node test/sanitize.test.js",
     "test:license": "node test/license.test.js",
-    "test:envlimits": "node test/envlimits.test.js"
+    "test:envlimits": "node test/envlimits.test.js",
+    "test:security-doc": "node test/security-doc.test.js"
   },
   "dependencies": {
     "bittorrent-tracker": "^11.2.1",
