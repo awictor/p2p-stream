@@ -31,8 +31,8 @@ function loadDashboard(stats) {
   const m = HTML.match(/<script>([\s\S]*?)<\/script>/);
   if (!m) throw new Error("no inline <script> found in dashboard.html");
   const els = {};
-  const ids = ["offload", "bar", "viewers", "http", "p2p", "upload"];
-  for (const id of ids) els[id] = { textContent: "", style: {} };
+  const ids = ["offload", "bar", "viewers", "http", "p2p", "upload", "hosts", "tracked", "loopwarn"];
+  for (const id of ids) els[id] = { textContent: "", style: {}, className: "" };
 
   const captured = {};
   const doc = { getElementById: (id) => els[id] };
@@ -83,6 +83,37 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     check("http formatted", els.http.textContent, "94.4 MB");
     check("p2p formatted", els.p2p.textContent, "167.5 MB");
     check("upload formatted", els.upload.textContent, "171.1 MB");
+  }
+
+  console.log("\ntrust signals: distinct hosts, tracked/max, and the loopback warning (iter 81):");
+  {
+    // Single-host swarm: real P2P bytes, good-looking %, but ONE host — the warning MUST fire, or
+    // the operator reads a loopback demo as a cross-network result.
+    const one = loadDashboard({
+      viewers: 4, httpBytes: 1e6, p2pBytes: 3e6, uploadBytes: 3e6, offloadRatio: 0.75,
+      distinctHosts: 1, tracked: 4, maxClients: 5000,
+    });
+    await one.tick();
+    check("distinctHosts rendered", one.els.hosts.textContent, 1);
+    check("tracked shows count / ceiling", one.els.tracked.textContent, "4 / 5000");
+    check("loopwarn is SHOWN at 1 host", one.els.loopwarn.className.includes("show"), true);
+
+    // Two hosts: a genuine cross-network run. The warning must be HIDDEN.
+    const two = loadDashboard({
+      viewers: 4, httpBytes: 1e6, p2pBytes: 3e6, uploadBytes: 3e6, offloadRatio: 0.75,
+      distinctHosts: 2, tracked: 4, maxClients: 5000,
+    });
+    await two.tick();
+    check("distinctHosts rendered as 2", two.els.hosts.textContent, 2);
+    check("loopwarn is HIDDEN at 2 hosts", two.els.loopwarn.className.includes("show"), false);
+
+    // Missing field (older server): distinctHosts absent. Must NOT crash, must NOT falsely cry
+    // loopback (unknown != single-host), and renders a placeholder rather than "undefined"/"NaN".
+    const missing = loadDashboard({ viewers: 4, httpBytes: 1e6, p2pBytes: 3e6, uploadBytes: 0, offloadRatio: 0.75 });
+    await missing.tick();
+    check("missing distinctHosts -> placeholder, not 'undefined'/'NaN'", missing.els.hosts.textContent, "—");
+    check("loopwarn HIDDEN when hosts is unknown (no false loopback)", missing.els.loopwarn.className.includes("show"), false);
+    check("tracked placeholder when absent", missing.els.tracked.textContent, "—");
   }
 
   console.log("\nedge ratios round correctly (the headline number):");

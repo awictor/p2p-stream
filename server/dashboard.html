@@ -17,17 +17,28 @@
     .bar { height:14px; border-radius:7px; background:#30363d; overflow:hidden; margin-top:.8rem; }
     .bar > span { display:block; height:100%; background:linear-gradient(90deg,#238636,#3fb950); width:0; transition:width .4s; }
     small { color:#8b949e; }
+    /* Loopback warning: a % from tabs on ONE box is not a cross-network result. Hidden until the
+       swarm is confirmed single-host, then loud — this is the FIRST thing a paying operator must
+       know before believing the offload figure. */
+    .warn { grid-column:1/-1; display:none; background:#3d1d00; border:1px solid #bb8009;
+      color:#f0b429; border-radius:10px; padding:.8rem 1.1rem; font-size:.95rem; }
+    .warn.show { display:block; }
   </style>
 </head>
 <body>
   <h1>P2P Live Streaming — Bandwidth Offload <small>(polls /stats every 2s)</small></h1>
   <div class="grid">
+    <div class="warn" id="loopwarn">⚠ LOOPBACK — every viewer is on ONE host, so this offload % is
+      a single-box demo, NOT a cross-network result. Run viewers on separate machines to prove it
+      (see <code>npm run verify:remote</code>).</div>
     <div class="card offload">
       <div class="label">Offload ratio — bytes served peer-to-peer vs origin</div>
       <div class="val" id="offload">0%</div>
       <div class="bar"><span id="bar"></span></div>
     </div>
     <div class="card"><div class="label">Active viewers</div><div class="val" id="viewers">0</div></div>
+    <div class="card"><div class="label">Distinct hosts <small>(≥2 = cross-network)</small></div><div class="val" id="hosts">0</div></div>
+    <div class="card"><div class="label">Tracked / max</div><div class="val" id="tracked">0</div></div>
     <div class="card"><div class="label">Origin (HTTP) bytes</div><div class="val" id="http">0</div></div>
     <div class="card"><div class="label">P2P download bytes</div><div class="val" id="p2p">0</div></div>
     <div class="card"><div class="label">P2P upload bytes</div><div class="val" id="upload">0</div></div>
@@ -49,16 +60,33 @@
       do { b /= 1024; i++; } while (b >= 1024 && i < u.length - 1);
       return b.toFixed(1) + " " + u[i];
     };
+    // A DOM write that tolerates a missing element, so adding a /stats field the page does not yet
+    // render (or a test stub without that id) never throws and kills the whole tick.
+    const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
     async function tick() {
       try {
         const s = await (await fetch("/stats")).json();
         const pct = Math.round(s.offloadRatio * 100);
-        document.getElementById("offload").textContent = pct + "%";
-        document.getElementById("bar").style.width = pct + "%";
-        document.getElementById("viewers").textContent = s.viewers;
-        document.getElementById("http").textContent = fmt(s.httpBytes);
-        document.getElementById("p2p").textContent = fmt(s.p2pBytes);
-        document.getElementById("upload").textContent = fmt(s.uploadBytes);
+        setText("offload", pct + "%");
+        const bar = document.getElementById("bar"); if (bar) bar.style.width = pct + "%";
+        setText("viewers", s.viewers);
+        setText("http", fmt(s.httpBytes));
+        setText("p2p", fmt(s.p2pBytes));
+        setText("upload", fmt(s.uploadBytes));
+
+        // Trust signals shipped to /stats at iters 73/75. hosts answers "is this real or loopback";
+        // tracked/max answers "is the swarm near its ceiling or under a flood".
+        const hosts = Number(s.distinctHosts);
+        setText("hosts", Number.isFinite(hosts) ? hosts : "—");
+        const tracked = Number(s.tracked), max = Number(s.maxClients);
+        setText("tracked", Number.isFinite(tracked) ? (tracked + (Number.isFinite(max) ? " / " + max : "")) : "—");
+
+        // The loopback warning is the FIRST thing an operator must see before trusting the %. Show
+        // it whenever the swarm is confirmed single-host (hosts <= 1). A MISSING distinctHosts
+        // (older server, hosts is NaN) is treated as UNKNOWN — do not assert cross-network, but do
+        // not cry loopback either; leave the warning hidden rather than claim a false negative.
+        const warn = document.getElementById("loopwarn");
+        if (warn) warn.className = "warn" + (Number.isFinite(hosts) && hosts <= 1 ? " show" : "");
       } catch (e) { /* server restart etc; keep polling */ }
     }
     setInterval(tick, 2000); tick();
