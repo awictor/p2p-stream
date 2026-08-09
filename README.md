@@ -88,10 +88,13 @@ from the page host, so renumbering one leaves the viewer talking to nothing with
 `npm run test:compose` asserts those ports *against `web/p2p-config.js` itself*, so a change to the
 derivation fails the test rather than silently disagreeing.
 
-> ⚠ `docker compose config` has **not** been run against this file — there is no docker binary
-> where it was written, so the syntax and the images are unverified. The test pins the invariants
-> that fail silently (ports, the shared volume, read-only consumer, no secrets); see the unchecked
-> boxes in `.p2p-loop/manual-qa.md`.
+The file **does parse** — `npm run check:configs` runs a real YAML parse of it (and `nginx -t` on
+`origin/nginx.conf`) before the test suite, so a malformed config fails in the first second with a
+line and column rather than after 600 assertions.
+
+> ⚠ Still unproven: `docker compose config` has not been run, so the compose **schema** (image tags,
+> key names) is unvalidated — that needs a docker binary. Parse + structure are checked; whether the
+> images pull and run is an unchecked box in `.p2p-loop/manual-qa.md`.
 
 ### Off localhost you need HTTPS + WSS — there is a config for it
 
@@ -121,6 +124,7 @@ Automated, no services needed:
 npm test                  # 643 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
                           #                 ledger 37, claim 55, participation 35, forgery 29, sybil 29, origin 42,
                           #                 viewer 27, spread 43, deploy 31, verdict 32, compose 26
+                          # ...plus check:configs (5 checks: real YAML parse + nginx -t), which runs FIRST
 ```
 
 With the four services up:

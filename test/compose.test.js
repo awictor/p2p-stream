@@ -23,6 +23,7 @@
 import { readFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import path from "path";
+import YAML from "yaml";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
@@ -49,41 +50,30 @@ const RAW = readFileSync(COMPOSE_PATH, "utf8");
 const YML = RAW.split(/\r?\n/).map((l) => l.replace(/#.*$/, "")).join("\n");
 
 /**
- * Minimal block-YAML reader for the one shape this file uses: `services:` mapping of names to
- * mappings, each possibly holding `ports:` and `volumes:` sequences. Deliberately not a general
- * YAML parser — adding a dependency to test a config file would be worse than the config.
+ * Read the compose file with a REAL YAML parser (P2P-0053). This replaced a hand-rolled block
+ * reader written to avoid a dependency — which was the only thing standing between a malformed file
+ * and a green suite, since it agreed with itself by construction. `scripts/check-configs.mjs`
+ * proves the file parses; this normalises it into the shape the assertions below want.
+ *
+ * Still NOT the compose schema: only `docker compose config` validates image tags and key names,
+ * and that needs a docker binary. What is proven here is parse + structure.
  */
-function parseServices(text) {
-  const lines = text.split(/\r?\n/);
+function servicesFrom(doc) {
   const out = {};
-  let inServices = false, cur = null, listKey = null;
-  for (const line of lines) {
-    if (/^\S/.test(line)) {                       // any top-level key ends the services block
-      inServices = /^services:/.test(line);
-      cur = null; listKey = null;
-      continue;
-    }
-    if (!inServices || !line.trim()) continue;
-    const indent = line.match(/^\s*/)[0].length;
-    const body = line.trim();
-    if (indent === 2 && body.endsWith(":")) {     // a service name
-      cur = body.slice(0, -1);
-      out[cur] = { ports: [], volumes: [], raw: [] };
-      listKey = null;
-      continue;
-    }
-    if (!cur) continue;
-    out[cur].raw.push(body);
-    if (indent === 4 && /^(ports|volumes):$/.test(body)) { listKey = body.slice(0, -1); continue; }
-    if (indent === 4) { listKey = null; continue; }
-    if (indent >= 6 && body.startsWith("- ") && listKey) {
-      out[cur][listKey].push(body.slice(2).replace(/^["']|["']$/g, ""));
-    }
+  for (const [name, svc] of Object.entries((doc && doc.services) || {})) {
+    out[name] = {
+      ports: (svc?.ports || []).map(String),
+      volumes: (svc?.volumes || []).map(String),
+      // Flattened for the substring assertions on command/entrypoint below.
+      raw: JSON.stringify(svc || {}),
+    };
   }
   return out;
 }
 
-const services = parseServices(YML);
+const doc = YAML.parse(RAW);
+const services = servicesFrom(doc);
+
 const allPublished = Object.values(services).flatMap((s) => s.ports);
 // "8080:8080" -> host port 8080
 const hostPorts = allPublished.map((p) => Number(String(p).split(":")[0])).filter(Number.isFinite);
@@ -146,7 +136,7 @@ console.log("\nthe four services, and one shared volume that makes the origin wo
 
 console.log("\nthe segmenter runs segment.sh, not a duplicated ffmpeg command line");
 {
-  const seg = services.segmenter.raw.join(" ");
+  const seg = services.segmenter.raw;   // JSON of the service block, from the real parse
   // The encoder flags (2s segments, fMP4, independent_segments, LIST_SIZE 90) are load-bearing and
   // pinned by test/segment.test.js. Duplicating them here would create a second source of truth
   // that no test compares against the first.

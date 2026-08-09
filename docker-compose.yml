@@ -16,11 +16,12 @@
 # Without it the origin serves an empty directory forever and the symptom is a viewer that
 # never starts — not an error anywhere.
 #
-# ── NOT VALIDATED ──────────────────────────────────────────────────────────────────────────
-# ⚠ `docker compose config` has NOT been run against this file: there is no docker binary in
-# the environment that wrote it. test/compose.test.js parses it and asserts the invariants that
-# fail silently (ports, the shared volume, service count, no secrets), but the syntax and the
-# images themselves are unverified. See the unchecked boxes in .p2p-loop/manual-qa.md.
+# ── WHAT IS AND IS NOT VERIFIED ────────────────────────────────────────────────────────────
+# `npm run check:configs` performs a REAL YAML parse of this file (iter 63) plus `nginx -t` on
+# origin/nginx.conf, and runs before the test suite. So the syntax IS checked.
+# ⚠ Still unproven: `docker compose config` has not run (no docker binary), so the compose SCHEMA
+# — image tags, key names — is unvalidated, as is whether the images pull and run. Unchecked boxes
+# in .p2p-loop/manual-qa.md.
 
 services:
   # 1) Origin segmenter. ffmpeg turns a file into LL-HLS CMAF and writes into the shared volume.
