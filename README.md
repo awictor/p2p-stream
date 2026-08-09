@@ -119,6 +119,14 @@ copy-paste line and the full routing table.
 > instead — a wrong `/tracker` route reads as "peers never connect", not as an error. Full
 > verified/unverified table: [deploy/README.md](deploy/README.md#exactly-what-is-and-is-not-verified).
 
+## Configuration
+The stack runs with **no configuration** — every knob has a working default. To override, copy
+[`.env.example`](.env.example) and set only what you need. It documents each operator-facing
+variable with its default and purpose, including the security-guard limits `SECURITY.md` tells you
+to tune (`MAX_CLIENTS`, `WS_MAX_PAYLOAD`, `MAX_REPORT_BYTES`, `MIN_ATTESTERS`, …) and the
+`verify:remote` target overrides (`STATS_URL`, `PORT`, …). `npm run test:envdoc` fails if the code
+reads an env var that `.env.example` does not document, so the list cannot silently drift.
+
 ## Verify
 Automated, no services needed:
 ```bash
