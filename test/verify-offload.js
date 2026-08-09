@@ -58,6 +58,9 @@ const WATCH_S = arg("watch", 90);
 const STAGGER_S = arg("stagger", 5);
 const HEADED = process.argv.includes("--headed");
 const CONTROL = process.argv.includes("--control");
+// --remote drives NO browser. The viewers are real humans on real machines; this only reads the
+// metrics server they are reporting to and prints a verdict about it.
+const REMOTE = process.argv.includes("--remote");
 
 // --participation 100,75,50,25 -> run once per participation rate and tabulate what the platform
 // actually saves when only some viewers relay. Every other number in this repo assumes 100%.
@@ -205,6 +208,49 @@ async function preflight() {
       process.exit(2);
     }
   }
+}
+
+// --remote: read a REMOTE metrics server and print a verdict for a two-machine run.
+//
+// This drives nothing. Every other mode in this file opens browsers on this box, which is the one
+// thing a cross-network check must not do — the viewers are people on other machines. So this is
+// deliberately a single GET plus remoteVerdict(), and its whole value is that the operator is TOLD
+// the answer instead of eyeballing a dashboard.
+async function runRemote() {
+  console.log(`REMOTE VERDICT — reading ${STATS_URL}`);
+  console.log("  (drives no browser: the viewers must already be playing on their own machines)\n");
+  let stats = null;
+  try {
+    stats = await getJson(STATS_URL);
+  } catch (e) {
+    // A failed fetch is passed as null rather than thrown, so the verdict function produces the
+    // diagnosis and this function keeps only one path for printing it.
+    console.log(`  could not read /stats: ${e.message}`);
+  }
+  const v = remoteVerdict(stats);
+
+  if (stats) {
+    console.log(`  viewers reporting: ${stats.viewers}`);
+    console.log(`  distinct hosts:    ${stats.distinctHosts ?? "not reported by this server"}` +
+      (Number(stats.loopbackClients) ? `  (${stats.loopbackClients} on the metrics host itself)` : ""));
+    console.log(`  p2p bytes:         ${stats.p2pBytes}`);
+    console.log(`  offload ratio:     ${Math.round((Number(stats.offloadRatio) || 0) * 100)}%`);
+    console.log("");
+  }
+
+  if (v.pass) {
+    console.log(`PASS(0): ${v.reason}`);
+    for (const c of v.caveats || []) console.log(`  ⚠ ${c}`);
+  } else if (v.code === 2) {
+    // REFUSED, not failed. The run may be working perfectly and still prove nothing about
+    // networks, so this is worded as "cannot judge" rather than "broken".
+    console.log(`REFUSED(2): ${v.reason}`);
+    console.log(`  -> ${v.fix}`);
+  } else {
+    console.log(`FAIL(1): ${v.reason}`);
+    console.log(`  -> ${v.fix}`);
+  }
+  process.exitCode = v.code;
 }
 
 // One measured run at a given viewer count. `stopEarly` short-circuits as soon as any P2P
@@ -722,6 +768,79 @@ export function offloadVerdict({ p2pBytes, p2pSegments, cumulativeP2pBytes = nul
         : segs === 0 ? "P2P bytes counted but no segment was reported P2P — accounting mismatch"
         : "P2P segments reported but zero bytes — accounting mismatch"),
     staleWarning,
+  };
+}
+
+/**
+ * remoteVerdict — the two-machine verdict, computed from a single `/stats` read (iter 70).
+ *
+ * THE MILESTONE HAS BEEN USER-GATED FOR 56 ITERATIONS, and the last mile turned out not to be the
+ * second machine: it was that nobody is TOLD whether their run passed. The guide asked the user to
+ * open a dashboard and eyeball five numbers, and 33 checklist boxes have never been ticked.
+ *
+ * ⚠ THE REFUSAL IS THE POINT. The easy version of this function reads `viewers >= 2 && p2pBytes > 0`
+ * and prints PASS — which every existing loopback run already satisfies. That would manufacture the
+ * exact claim HARD RULE 2 forbids: certifying a cross-network result from tabs on one box that
+ * happen to have typed a LAN URL. So a single distinct host is an explicit REFUSAL (code 2), not a
+ * pass and not a plain failure, because the run may well have worked while proving nothing about
+ * networks. `distinctHosts` comes from the report SOCKET (see hostFingerprint in server/metrics.js),
+ * so a client cannot claim to be elsewhere.
+ *
+ * Codes: 0 = cross-network offload proven. 1 = ran, did not prove it (cause-specific). 2 = cannot
+ * be judged (loopback-only, or a metrics server too old to report hosts — silence about hosts must
+ * never read as "hosts differ").
+ */
+export function remoteVerdict(stats) {
+  const fail = (code, reason, fix) => ({ pass: false, code, reason, fix, viewers: null, hosts: null });
+  if (!stats || typeof stats !== "object") {
+    return fail(2, "no /stats response — the metrics server is not reachable at that URL",
+      "start the stack with `npm start` on the ORIGIN machine, then re-run with STATS_URL pointing at it");
+  }
+  const viewers = Number(stats.viewers) || 0;
+  const p2pBytes = Number(stats.p2pBytes) || 0;
+  const hosts = stats.distinctHosts;
+  const loopbackClients = Number(stats.loopbackClients) || 0;
+
+  // An older metrics server has no `distinctHosts` at all. Treating a missing field as "not
+  // loopback" would let this print PASS on exactly the setup it exists to reject, so absence is
+  // unjudgeable rather than permissive.
+  if (hosts === undefined || hosts === null) {
+    return fail(2, "this metrics server does not report distinctHosts, so a cross-network claim cannot be checked",
+      "update the origin machine to a build that includes host fingerprinting, then re-run");
+  }
+
+  // Order matters below: report the FIRST thing that is actually missing, so the operator fixes one
+  // cause at a time rather than reading a generic failure.
+  if (viewers === 0) {
+    return { ...fail(1, "no viewers are reporting at all", "open the viewer URL on BOTH machines and leave the tabs playing, then re-run within 15s"), viewers, hosts };
+  }
+  if (viewers === 1) {
+    return { ...fail(1, "only 1 viewer is reporting — a lone peer has nobody to relay with, so 0% is arithmetic, not a measurement",
+      "open the same viewer URL on the SECOND machine; if it is open already, its POST to /metrics is not arriving (firewall, or a localhost METRICS_URL baked into its page)"), viewers, hosts };
+  }
+  // ≥2 viewers, all one host: the run may be fine, but it is not evidence about networks.
+  if (Number(hosts) < 2) {
+    return { ...fail(2, `${viewers} viewers are reporting but they all share ONE host — this is a loopback run wearing a LAN URL, not a cross-network result`,
+      "the second viewer must run on a different machine; a second tab, window or profile on this box cannot prove this"), viewers, hosts: Number(hosts) };
+  }
+  if (p2pBytes === 0) {
+    return { ...fail(1, `${viewers} viewers across ${hosts} hosts, but zero P2P bytes — the peers found the tracker or did not, and either way no segment crossed the network`,
+      "check peer connects on the dashboard first, NOT buffer settings; then confirm UDP is not blocked between the machines and that both viewers share one swarmId"), viewers, hosts: Number(hosts) };
+  }
+  return {
+    pass: true,
+    code: 0,
+    viewers,
+    hosts: Number(hosts),
+    reason: `cross-network P2P offload PROVEN: ${p2pBytes} P2P bytes across ${viewers} viewers on ${hosts} distinct hosts`,
+    // Even a pass carries its caveats, because the number this prints is smaller than it looks.
+    fix: null,
+    caveats: [
+      loopbackClients > 0
+        ? `${loopbackClients} of the ${viewers} viewers are on the metrics host itself, so part of this traffic never left the box`
+        : null,
+      "this proves peers relayed ACROSS machines; it does not measure the bill reduction — that needs the control arm (`npm run verify:control`)",
+    ].filter(Boolean),
   };
 }
 
@@ -1449,6 +1568,12 @@ const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolv
 
 (async () => {
   if (!isMain) return;
+  // --remote is FIRST and launches nothing. Every other mode drives browsers on THIS box, which
+  // is precisely what a two-machine check must not do: the viewers are humans on other machines.
+  if (REMOTE) {
+    await runRemote();
+    return;
+  }
   if (participationArg) {
     await runParticipationSweep();
     return;

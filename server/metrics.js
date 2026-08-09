@@ -6,8 +6,27 @@ import express from "express";
 import path from "path";
 import { networkInterfaces } from "os";
 import { fileURLToPath } from "url";
+import { createHash, randomBytes } from "crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Per-PROCESS salt for the client-host hash below. Regenerated every boot on purpose: the IPv4
+// space is small enough to enumerate, so an unsalted hash of an address is not an anonymisation,
+// it is an encoding. A fresh salt also means two runs' hashes cannot be correlated.
+const HOST_SALT = randomBytes(16);
+
+// A viewer's network origin, reduced to something the dashboard can publish. `/stats` is served to
+// every viewer, so putting raw peer IPs there would leak each viewer's address to all the others —
+// exactly the kind of thing a P2P product must not do casually. What callers actually need is only
+// "are these two reports from the SAME host or different ones", and a hash answers that.
+export function hostFingerprint(ip, salt = HOST_SALT) {
+  if (typeof ip !== "string" || !ip) return null;
+  // Express hands back IPv4-mapped IPv6 for a v4 client ("::ffff:127.0.0.1"). Normalise, or the
+  // same machine reaching us over both stacks looks like two hosts and fakes a cross-network run.
+  const addr = ip.replace(/^::ffff:/i, "").replace(/^\[|\]$/g, "").toLowerCase();
+  const loopback = addr === "::1" || addr === "127.0.0.1" || /^127\./.test(addr);
+  return { host: createHash("sha256").update(salt).update(addr).digest("hex").slice(0, 12), loopback };
+}
 
 // `now` is injectable purely so tests can drive the stale/evict windows deterministically
 // instead of sleeping for real seconds. Production always uses Date.now.
@@ -91,12 +110,18 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
     // evicted, and counted as an active viewer forever. Server time also can't be
     // skewed by a wrong client clock or forged to keep an entry alive.
     // `ts` is still accepted and echoed as `clientTs` for debugging; nothing reads it.
+    // The report's network origin, hashed (see hostFingerprint). Taken from the SOCKET, never
+    // from the body: a client-supplied host would let one machine claim to be several and
+    // manufacture the cross-network result `verify:remote` exists to certify.
+    const fp = hostFingerprint(req.socket?.remoteAddress || req.ip || "");
     clients.set(clientId, {
       httpBytes: Number(httpBytes) || 0,
       p2pBytes: Number(p2pBytes) || 0,
       uploadBytes: Number(uploadBytes) || 0,
       lastSeen: now(),
       clientTs: Number(ts) || null,
+      host: fp?.host || null,
+      loopback: fp?.loopback ?? null,
     });
     res.json({ ok: true });
   });
@@ -124,11 +149,20 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
 
     let http = retired.httpBytes, p2p = retired.p2pBytes, upload = retired.uploadBytes;
     let active = 0;
+    // Hosts are counted over ACTIVE clients only. A host that reported an hour ago and left is
+    // not evidence that this run spans two machines, and counting it would certify a
+    // cross-network result from two sequential single-machine runs.
+    const activeHosts = new Set();
+    let loopbackClients = 0;
     for (const c of clients.values()) {
       http += c.httpBytes;
       p2p += c.p2pBytes;
       upload += c.uploadBytes;
-      if (t - c.lastSeen <= STALE_MS) active += 1;
+      if (t - c.lastSeen <= STALE_MS) {
+        active += 1;
+        if (c.host) activeHosts.add(c.host);
+        if (c.loopback) loopbackClients += 1;
+      }
     }
 
     // Fold attestations into per-peer credit. Evict alongside the byte counters so a long run
@@ -219,6 +253,11 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
       // Exposed so the bound is OBSERVABLE. An unbounded Map with no counter stays invisible
       // until it is a production problem; `tracked` earned its place the same way.
       trackedPeerIds: peerToClient.size,
+      // WHERE the active viewers are reporting from, as counts only — never addresses. This is
+      // what lets `verify:remote` refuse to certify a loopback run wearing a LAN URL: with
+      // distinctHosts === 1 every "viewer" is one machine's tabs, whatever URL they typed.
+      distinctHosts: activeHosts.size,
+      loopbackClients,
     };
   }
 

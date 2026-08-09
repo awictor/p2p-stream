@@ -122,9 +122,10 @@ copy-paste line and the full routing table.
 ## Verify
 Automated, no services needed:
 ```bash
-npm test                  # 712 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
+npm test                  # 764 assertions: metrics 70, tracker 30, config 71, dashboard 24, start 34, segment 28,
                           #                 ledger 37, claim 75, participation 35, forgery 29, sybil 29, origin 42,
-                          #                 viewer 27, spread 43, deploy 32, verdict 32, compose 26, checkconfigs 27, runnginx 21
+                          #                 viewer 27, spread 43, deploy 32, verdict 32, compose 26, checkconfigs 27,
+                          #                 runnginx 21, remote 52
                           # ...plus check:configs (5 checks: real YAML parse + nginx -t), which runs FIRST
 ```
 
@@ -133,6 +134,7 @@ With the four services up:
 npm run verify            # the ONLY accepted proof of offload (~2min)
 npm run verify:sweep      # offload vs viewer count, 1/2/4/8 (~4min)
 npm run verify:control    # P2P ON vs OFF, side by side (~2min)
+npm run verify:remote     # verdict for a TWO-MACHINE run; reads STATS_URL, drives no browser
 npm run verify:windows    # sweep p2pDownloadTimeWindow: saving vs viewer cost (~5min)
 npm run verify:participation  # saving vs % of viewers who actually relay (~5min)
 ```
@@ -549,8 +551,27 @@ The viewer derives the origin, tracker and metrics URLs from the page's own host
 config editing is needed. Override individually with `?origin=`, `?tracker=`, `?metrics=`,
 `?host=` or `?swarm=` if the services are split across hosts.
 
-Watch `http://<LAN_IP>:8001` — offload above 0% with viewers on separate machines is the
-result that matters. Notes from testing this path:
+Then, on any machine, ask for a verdict instead of reading the dashboard:
+
+```bash
+STATS_URL=http://<LAN_IP>:8001/stats npm run verify:remote
+```
+
+It drives no browser — the viewers are you, on your machines — and exits:
+
+| Exit | Meaning |
+|---|---|
+| `0` | **Cross-network offload proven.** ≥2 viewers, ≥2 distinct hosts, real P2P bytes. |
+| `1` | Ran, proved nothing, and names which cause: no viewers / one viewer / hosts but no bytes. |
+| `2` | **Cannot be judged** — all viewers share ONE host, or the server is too old to report hosts. |
+
+> ⚠️ **Exit 2 is a refusal, not a failure.** A run of four tabs on one box hits 79% offload with
+> real P2P bytes, and a check that read `viewers >= 2 && p2pBytes > 0` would stamp that PASS — which
+> is the one claim this project must never make. `distinctHosts` is derived from the report
+> **socket**, not the request body, so a client cannot claim to be somewhere it isn't. What `/stats`
+> publishes is a salted hash and a count, never a viewer's address.
+
+Notes from testing this path:
 
 - **Plain `http://` is fine on a private IP.** Chromium permits WebRTC there. Only
   `crypto.randomUUID()` is secure-context-gated, and the viewer now falls back when it is

@@ -12,7 +12,7 @@
     "origin:loop": "bash origin/segment.sh loop origin/sample.mp4",
     "origin:rtmp": "bash origin/segment.sh rtmp",
     "nginx": "bash origin/run-nginx.sh",
-    "test": "node scripts/check-configs.mjs && node test/metrics.test.js && node test/tracker.test.js && node test/config.test.js && node test/dashboard.test.js && node test/start.test.js && node test/ledger.test.js && node test/claim.test.js && node test/participation.test.js && node test/forgery.test.js && node test/sybil.test.js && node test/segment.test.js && node test/origin.test.js && node test/viewer.test.js && node test/spread.test.js && node test/deploy.test.js && node test/verdict.test.js && node test/compose.test.js && node test/checkconfigs.test.js && node test/runnginx.test.js",
+    "test": "node scripts/check-configs.mjs && node test/metrics.test.js && node test/tracker.test.js && node test/config.test.js && node test/dashboard.test.js && node test/start.test.js && node test/ledger.test.js && node test/claim.test.js && node test/participation.test.js && node test/forgery.test.js && node test/sybil.test.js && node test/segment.test.js && node test/origin.test.js && node test/viewer.test.js && node test/spread.test.js && node test/deploy.test.js && node test/verdict.test.js && node test/compose.test.js && node test/checkconfigs.test.js && node test/runnginx.test.js && node test/remote.test.js",
     "test:metrics": "node test/metrics.test.js",
     "test:tracker": "node test/tracker.test.js",
     "test:config": "node test/config.test.js",
@@ -21,6 +21,7 @@
     "verify": "node test/verify-offload.js",
     "verify:sweep": "node test/verify-offload.js --sweep 1,2,4,8 --watch 45",
     "verify:control": "node test/verify-offload.js --control --watch 45",
+    "verify:remote": "node test/verify-offload.js --remote",
     "test:ledger": "node test/ledger.test.js",
     "test:claim": "node test/claim.test.js",
     "verify:windows": "node test/verify-offload.js --windows default,600,120,30 --watch 40",
@@ -37,7 +38,8 @@
     "test:compose": "node test/compose.test.js",
     "check:configs": "node scripts/check-configs.mjs",
     "test:checkconfigs": "node test/checkconfigs.test.js",
-    "test:runnginx": "node test/runnginx.test.js"
+    "test:runnginx": "node test/runnginx.test.js",
+    "test:remote": "node test/remote.test.js"
   },
   "dependencies": {
     "bittorrent-tracker": "^11.2.1",
