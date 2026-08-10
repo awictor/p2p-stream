@@ -8,11 +8,35 @@
 import { networkInterfaces } from "os";
 import { fileURLToPath } from "url";
 import path from "path";
+import http from "http";
 import { Server } from "bittorrent-tracker";
 import { startMetrics } from "./metrics.js";
+import { issueIdentity, issueCert } from "./identity.js";
 
 const PORT = Number(process.env.PORT || 8000);
 const METRICS_PORT = Number(process.env.METRICS_PORT || 8001);
+const ISSUER_PORT = Number(process.env.ISSUER_PORT || 8002);
+
+// The tracker's OWN ed25519 identity — the root of the certified-credit chain (P2P-0071). It signs
+// each peer's pubKey (a cert), and the metrics server is configured with only this identity's PUBLIC
+// key (TRACKER_PUBKEY) to VERIFY certs. The private key lives ONLY here.
+//   Loaded from TRACKER_PRIVKEY / TRACKER_PUBKEY if set (HARD RULE 5: secret via env, never in the
+//   repo); otherwise a fresh keypair is generated at boot and its public key logged so an operator
+//   can copy it to the metrics server's TRACKER_PUBKEY. A generated key is fine for dev/loopback; a
+//   real deploy sets the env so the pair survives restarts.
+export function loadTrackerIdentity(env = process.env) {
+  if (env.TRACKER_PRIVKEY && env.TRACKER_PUBKEY) {
+    return { privateKey: env.TRACKER_PRIVKEY, publicKey: env.TRACKER_PUBKEY, generated: false };
+  }
+  return { ...issueIdentity(), generated: true };
+}
+
+// Issue a cert for a peer-submitted public key: the tracker's signature over that pubKey. Pure —
+// takes the identity so it is testable without booting anything. Returns null on bad input.
+export function issueTrackerCert(peerPublicKeyB64, identity) {
+  if (!identity || typeof identity.privateKey !== "string") return null;
+  return issueCert(peerPublicKeyB64, identity.privateKey);
+}
 
 // Node binds 0.0.0.0 by default, so these services are ALREADY reachable from other
 // machines on the LAN. Print the routable address rather than "localhost", which is what
@@ -49,6 +73,42 @@ export const TRACKER_CONFIG = {
   // announce (no response, no peer exchange). Omit it to accept all swarms.
 };
 
+// A tiny HTTP issuance endpoint: POST /issue {pubKey} -> {cert, trackerPubKey}. This is how a viewer
+// turns its self-minted keypair into a tracker-certified one before it starts reporting. Kept as a
+// bare http server (not express) to avoid coupling the tracker to the metrics dep, and returned so a
+// test/operator can close it. GET /pubkey exposes the tracker public key for TRACKER_PUBKEY setup.
+//   NOTE (HARD RULE 6): there is NO rate limit or proof-of-work here, so N browsers => N certs. This
+//   binds a key to an issuance event, it does not prove a distinct human. Rate/PoW is a later step.
+export function startIssuer(port, identity) {
+  const MAX_BODY = 4096; // a pubKey POST is ~100 bytes; cap hard on this public endpoint
+  const server = http.createServer((req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
+    if (req.method === "GET" && req.url === "/pubkey") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ trackerPubKey: identity.publicKey }));
+    }
+    if (req.method === "POST" && req.url === "/issue") {
+      let body = "", tooBig = false;
+      req.on("data", (c) => { body += c; if (body.length > MAX_BODY) { tooBig = true; req.destroy(); } });
+      req.on("end", () => {
+        if (tooBig) { res.writeHead(413); return res.end(); }
+        let pubKey;
+        try { pubKey = JSON.parse(body).pubKey; } catch { res.writeHead(400, { "Content-Type": "application/json" }); return res.end(JSON.stringify({ error: "bad json" })); }
+        const cert = issueTrackerCert(pubKey, identity);
+        if (!cert) { res.writeHead(400, { "Content-Type": "application/json" }); return res.end(JSON.stringify({ error: "pubKey required" })); }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ cert, trackerPubKey: identity.publicKey }));
+      });
+      return;
+    }
+    res.writeHead(404); res.end();
+  });
+  server.listen(port);
+  return server;
+}
+
 // Build and start the real services. Exported so a test can drive it on throwaway ports and
 // close it, rather than being forced to reimplement the wiring it is meant to be checking.
 export function startTracker(port = PORT, metricsPort = METRICS_PORT) {
@@ -70,7 +130,18 @@ export function startTracker(port = PORT, metricsPort = METRICS_PORT) {
 
   // Metrics collector runs alongside (viewers POST their byte counters here).
   const metrics = startMetrics(metricsPort);
-  return { tracker, metrics };
+
+  // Identity issuer: mints certs so viewers can earn CERTIFIED credit (P2P-0070/0071). The metrics
+  // server verifies certs against this identity's PUBLIC key — set metrics' TRACKER_PUBKEY to it.
+  const identity = loadTrackerIdentity();
+  const issuer = startIssuer(ISSUER_PORT, identity);
+  console.log(`[tracker] identity issuer on http://localhost:${ISSUER_PORT} (POST /issue, GET /pubkey)`);
+  if (identity.generated) {
+    console.log("[tracker] GENERATED an ephemeral tracker identity. For certified credit, set the");
+    console.log(`[tracker]   metrics server's TRACKER_PUBKEY to: ${identity.publicKey}`);
+    console.log("[tracker]   and pin it across restarts via TRACKER_PRIVKEY/TRACKER_PUBKEY env.");
+  }
+  return { tracker, metrics, issuer, identity };
 }
 
 // Only bind ports when RUN AS A SCRIPT. Without this guard, merely importing this module to reach
