@@ -7,6 +7,7 @@ import path from "path";
 import { networkInterfaces } from "os";
 import { fileURLToPath } from "url";
 import { createHash, randomBytes } from "crypto";
+import { verifyReport } from "./identity.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -150,7 +151,7 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   // served and make offloadRatio jump backwards — which would also break the sweep's
   // delta arithmetic and contradict the published numbers. Session totals stay
   // monotonic; only the per-client bookkeeping is reclaimed.
-  const retired = { httpBytes: 0, p2pBytes: 0, uploadBytes: 0, count: 0, attestedUploadBytes: 0 };
+  const retired = { httpBytes: 0, p2pBytes: 0, uploadBytes: 0, count: 0, attestedUploadBytes: 0, signedAttestedBytes: 0 };
 
   // RECEIVER-ATTESTED UPLOAD. `uploadBytes` above is what a viewer claims about ITSELF, which a
   // modified client forges in one line — so the ad-free-for-relay tier cannot pay out on it.
@@ -178,7 +179,7 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   const peerToClient = new Map();
 
   app.post("/metrics", (req, res) => {
-    const { clientId: rawClientId, httpBytes = 0, p2pBytes = 0, uploadBytes = 0, ts, peerId, attest } = req.body || {};
+    const { clientId: rawClientId, httpBytes = 0, p2pBytes = 0, uploadBytes = 0, ts, peerId, attest, pubKey, sig } = req.body || {};
     if (!rawClientId || typeof rawClientId !== "string") return res.status(400).json({ error: "clientId required" });
     // Clamp the clientId LENGTH before it is used as a Map key. An unbounded string is both a
     // memory vector and a way to bloat every /stats response that echoes per-client data.
@@ -200,7 +201,19 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
         const n = sanitizeBytes(bytes);
         if (typeof pid === "string" && pid && n > 0) { byPeer[pid] = n; kept += 1; }
       }
-      attestations.set(clientId, { byPeer, lastSeen: now() });
+      // AUTHENTICATE THE CREDIT (P2P-0069). If the report carries a pubKey + sig that verifies over
+      // the canonical {clientId, attest}, this attestation is eligible for SIGNED credit — the only
+      // credit a payable reward tier may ever use. An unsigned or forge-signed report is still kept
+      // and still contributes to the legacy attestedUploadBytes cross-check (backward compatible; do
+      // NOT break the offload number or existing accounting), but it earns ZERO signed credit.
+      //   THREAT (HARD RULE 6): this authenticates that WHOEVER HOLDS THE KEY produced this exact
+      //   {clientId, attest}. It does NOT prove the key belongs to a distinct, tracker-vouched peer
+      //   — a self-supplied pubKey is still self-declared, so COLLUSION (two real keys vouching for
+      //   each other) is NOT closed here. Tracker-issued keys are P2P-0070. `signedAttestedBytes` is
+      //   therefore a stronger cross-check than the raw total, still NOT an authorisation to pay.
+      const signed = typeof pubKey === "string" && typeof sig === "string" &&
+        verifyReport({ clientId, attest }, sig, pubKey);
+      attestations.set(clientId, { byPeer, lastSeen: now(), signed: signed === true, pubKey: signed ? pubKey : null });
     }
     // Recency is stamped SERVER-SIDE, not taken from the client. Trusting `ts` meant a
     // report without one got lastSeen=0, and the `c.lastSeen &&` guards below then
@@ -278,7 +291,10 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
     // cannot grow the Map without bound, keeping the retired total monotonic for the same reason.
     for (const [id, a] of attestations) {
       if (t - a.lastSeen > EVICT_MS) {
-        for (const bytes of Object.values(a.byPeer)) retired.attestedUploadBytes += bytes;
+        for (const bytes of Object.values(a.byPeer)) {
+          retired.attestedUploadBytes += bytes;
+          if (a.signed) retired.signedAttestedBytes += bytes;
+        }
         attestations.delete(id);
       }
     }
@@ -293,6 +309,10 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
     // detect, so it is dropped rather than counted.
     const attestedByClient = {};
     let attestedTotal = retired.attestedUploadBytes;
+    // SIGNED credit: the same attested bytes, but ONLY from attestations whose report carried a
+    // verifying signature (P2P-0069). This is the number a payable tier would use; the gap between
+    // it and attestedTotal is exactly the unsigned/unauthenticated credit.
+    let signedAttestedTotal = retired.signedAttestedBytes;
     // Who vouched for whom, and how much each one vouched. Needed for the K-of-N filter below:
     // a raw sum cannot tell "20 receivers each saw 1MB" from "one receiver claims 20MB".
     const vouchers = new Map();   // creditedKey -> Map(attesterId -> bytes)
@@ -302,6 +322,7 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
         const servedBy = m && m.clientId;
         if (servedBy && servedBy === attestingId) continue;   // self-attestation, ignored
         attestedTotal += bytes;
+        if (a.signed) signedAttestedTotal += bytes;           // only signed credit is payable-grade
         const key = servedBy || `unmapped:${pid}`;
         attestedByClient[key] = (attestedByClient[key] || 0) + bytes;
         if (!vouchers.has(key)) vouchers.set(key, new Map());
@@ -348,6 +369,12 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
       attestedUploadBytes: attestedTotal,
       attestedByClient,
       attestingClients: attestations.size,
+      // SIGNED-credit split (P2P-0069): the subset of attestedUploadBytes whose report carried a
+      // verifying signature. This is the only credit a payable tier may use; attestedUploadBytes -
+      // signedAttestedBytes is the unauthenticated remainder, exposed so the gap is observable.
+      // NOTE: a verifying signature proves key possession, NOT tracker-vouched identity (P2P-0070),
+      // so signed credit still does not close COLLUSION — never a payout basis on its own.
+      signedAttestedBytes: signedAttestedTotal,
       // K-of-N FILTERED credit, reported ALONGSIDE the raw figure rather than replacing it. The gap
       // between them is the point: a large drop means credit was resting on too few witnesses or on
       // one voucher claiming too much. Hiding the raw number would hide that signal.
