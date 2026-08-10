@@ -7,7 +7,7 @@ import path from "path";
 import { networkInterfaces } from "os";
 import { fileURLToPath } from "url";
 import { createHash, randomBytes } from "crypto";
-import { verifyReport, verifyCert } from "./identity.js";
+import { verifyReport, verifyCert, verifyReceipt } from "./identity.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -158,7 +158,8 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   // served and make offloadRatio jump backwards — which would also break the sweep's
   // delta arithmetic and contradict the published numbers. Session totals stay
   // monotonic; only the per-client bookkeeping is reclaimed.
-  const retired = { httpBytes: 0, p2pBytes: 0, uploadBytes: 0, count: 0, attestedUploadBytes: 0, signedAttestedBytes: 0, certifiedAttestedBytes: 0 };
+  const retired = { httpBytes: 0, p2pBytes: 0, uploadBytes: 0, count: 0, attestedUploadBytes: 0, signedAttestedBytes: 0, certifiedAttestedBytes: 0, receiptedBytes: 0 };
+  const MAX_RECEIPTS = posIntEnv("MAX_RECEIPTS", 256); // cap receipts per report, like MAX_ATTEST_KEYS
 
   // RECEIVER-ATTESTED UPLOAD. `uploadBytes` above is what a viewer claims about ITSELF, which a
   // modified client forges in one line — so the ad-free-for-relay tier cannot pay out on it.
@@ -185,8 +186,15 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   // still being attributed to its evicted client.
   const peerToClient = new Map();
 
+  // PROOF-OF-DELIVERY receipts (P2P-0073). clientId -> { receipts: {segmentId: {bytes, verified}},
+  // lastSeen }. A receipt only counts toward receiptedBytes when it verifies under the report's
+  // pubKey AND that pubKey is CERTIFIED — the same trust floor as certifiedAttestedBytes, one step
+  // stronger because it is per-segment corroborated, not a bulk attest. Latest report per clientId
+  // replaces the prior (idempotent), evicted into `retired` on the same clock as attestations.
+  const receiptsByClient = new Map();
+
   app.post("/metrics", (req, res) => {
-    const { clientId: rawClientId, httpBytes = 0, p2pBytes = 0, uploadBytes = 0, ts, peerId, attest, pubKey, sig, cert } = req.body || {};
+    const { clientId: rawClientId, httpBytes = 0, p2pBytes = 0, uploadBytes = 0, ts, peerId, attest, pubKey, sig, cert, receipts } = req.body || {};
     if (!rawClientId || typeof rawClientId !== "string") return res.status(400).json({ error: "clientId required" });
     // Clamp the clientId LENGTH before it is used as a Map key. An unbounded string is both a
     // memory vector and a way to bloat every /stats response that echoes per-client data.
@@ -233,6 +241,34 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
         certified: certified === true,
         pubKey: signed ? pubKey : null,
       });
+    }
+    // PROOF-OF-DELIVERY (P2P-0073). Each receipt in `receipts[]` is a receiver's signature over one
+    // {segmentId, bytes, senderPeerId, receiverPeerId}. It counts toward receiptedBytes ONLY when it
+    // verifies under THIS report's pubKey AND that pubKey is tracker-CERTIFIED — receiptedBytes is
+    // therefore a subset of the trust floor certifiedAttestedBytes sits on, but per-segment
+    // corroborated rather than a bulk attest. A report may carry receipts without attest, so the
+    // cert status is recomputed here rather than reused from the attest block.
+    //   THREAT (HARD RULE 6): a verified receipt proves a receiver corroborated a specific transfer.
+    //   It does NOT prove the bytes were USEFUL (played) — not a QoE proof — and N certified keys
+    //   colluding can still mint mutually-corroborated receipts (rate/PoW at issuance still open).
+    if (Array.isArray(receipts) && receipts.length) {
+      const certifiedKey = typeof pubKey === "string" && typeof cert === "string" &&
+        TRACKER_PUBKEY && verifyCert(pubKey, cert, TRACKER_PUBKEY);
+      const kept = {};
+      let n = 0;
+      for (const r of receipts) {
+        if (n >= MAX_RECEIPTS) break;
+        // Dedup by segmentId within a report so a peer cannot list the same delivery N times.
+        if (!r || typeof r !== "object" || typeof r.segmentId !== "string") continue;
+        if (r.segmentId in kept) continue;
+        const rSig = r.sig;
+        const receiptObj = { segmentId: r.segmentId, bytes: r.bytes, senderPeerId: r.senderPeerId, receiverPeerId: r.receiverPeerId };
+        const ok = certifiedKey && typeof rSig === "string" && verifyReceipt(receiptObj, rSig, pubKey);
+        // Store the clamped byte figure; only a verified receipt gets nonzero credit.
+        kept[r.segmentId] = { bytes: ok ? sanitizeBytes(r.bytes) : 0, verified: ok === true };
+        n += 1;
+      }
+      receiptsByClient.set(clientId, { receipts: kept, lastSeen: now() });
     }
     // Recency is stamped SERVER-SIDE, not taken from the client. Trusting `ts` meant a
     // report without one got lastSeen=0, and the `c.lastSeen &&` guards below then
@@ -318,6 +354,14 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
         attestations.delete(id);
       }
     }
+    // Evict stale receipts on the same clock, folding verified bytes into `retired` so
+    // receiptedBytes stays monotonic like every other total.
+    for (const [id, rc] of receiptsByClient) {
+      if (t - rc.lastSeen > EVICT_MS) {
+        for (const r of Object.values(rc.receipts)) if (r.verified) retired.receiptedBytes += r.bytes;
+        receiptsByClient.delete(id);
+      }
+    }
     // Evict stale peerId mappings on the same clock. Without this the Map is unbounded AND
     // credit keeps resolving to clients that left long ago; an attacker who learns a retired
     // peerId could aim credit at a viewer that no longer exists. After eviction such a credit
@@ -337,6 +381,11 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
     // credit that is safe against self-minted-identity collusion. This is the number a payable tier
     // may actually use once tracker issuance is live.
     let certifiedAttestedTotal = retired.certifiedAttestedBytes;
+    // Proof-of-delivery total: verified receipts from certified keys, per-segment corroborated.
+    let receiptedTotal = retired.receiptedBytes;
+    for (const rc of receiptsByClient.values()) {
+      for (const r of Object.values(rc.receipts)) if (r.verified) receiptedTotal += r.bytes;
+    }
     // Who vouched for whom, and how much each one vouched. Needed for the K-of-N filter below:
     // a raw sum cannot tell "20 receivers each saw 1MB" from "one receiver claims 20MB".
     const vouchers = new Map();   // creditedKey -> Map(attesterId -> bytes)
@@ -405,6 +454,11 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
       // this figure is collusion-resistant enough to consider paying — and only once live tracker
       // issuance (P2P-0071) mints certs at announce; today it is 0 unless TRACKER_PUBKEY is set.
       certifiedAttestedBytes: certifiedAttestedTotal,
+      // PROOF-OF-DELIVERY (P2P-0073): bytes backed by a verified per-segment receipt signed by a
+      // CERTIFIED key. The strongest credit tier — corroborated at the segment level, not a bulk
+      // attest. Still NOT a QoE proof (delivered != played) and collusion via N certified keys
+      // remains open. 0 unless TRACKER_PUBKEY is set (nothing certifiable => no receipted credit).
+      receiptedBytes: receiptedTotal,
       trackerCertRequired: !!TRACKER_PUBKEY,
       // K-of-N FILTERED credit, reported ALONGSIDE the raw figure rather than replacing it. The gap
       // between them is the point: a large drop means credit was resting on too few witnesses or on
