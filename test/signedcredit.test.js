@@ -101,6 +101,43 @@ let clock = 1_700_000_000_000;
     await new Promise((r) => s3.close(r));
   }
 
+  console.log("\nthe signature is BOUND to clientId — a valid sig replayed under another clientId fails (iter 96)");
+  {
+    const p4 = 8164;
+    const s4 = startMetrics(p4, { now: () => clock });
+    await new Promise((r) => setTimeout(r, 300));
+    const post4 = (b) => fetch(`http://localhost:${p4}/metrics`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
+    await post4({ clientId: "srv", peerId: "peer-srv", uploadBytes: 5e6 });
+    const attest = { "peer-srv": 4_000_000 };
+    // rcv signs {clientId:"rcv", attest}. An attacker REPLAYS that sig under clientId "evil".
+    const rcvSig = signReport({ clientId: "rcv", attest }, rx.privateKey);
+    await post4({ clientId: "evil", peerId: "peer-evil", attest, pubKey: rx.publicKey, sig: rcvSig });
+    const s = await fetch(`http://localhost:${p4}/stats`).then((r) => r.json());
+    check("a sig bound to clientId 'rcv' earns 0 signed credit when POSTed as 'evil'", s.signedAttestedBytes, 0);
+    await new Promise((r) => s4.close(r));
+  }
+
+  console.log("\nsigned status does NOT persist: an UNSIGNED update after a signed report drops signed credit (iter 96)");
+  {
+    const p5 = 8165;
+    const s5 = startMetrics(p5, { now: () => clock });
+    await new Promise((r) => setTimeout(r, 300));
+    const post5 = (b) => fetch(`http://localhost:${p5}/metrics`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
+    await post5({ clientId: "srv", peerId: "peer-srv", uploadBytes: 5e6 });
+    const attest = { "peer-srv": 4_000_000 };
+    const sig = signReport({ clientId: "rcv", attest }, rx.privateKey);
+    await post5({ clientId: "rcv", peerId: "peer-rcv", attest, pubKey: rx.publicKey, sig });
+    let s = await fetch(`http://localhost:${p5}/stats`).then((r) => r.json());
+    check("signed after the signed report", s.signedAttestedBytes, 4_000_000);
+    // rcv now sends an UNSIGNED update (a peer that stops signing, or an attacker stripping the sig).
+    // The latest snapshot replaces the prior one; a stale signed flag must NOT keep crediting.
+    await post5({ clientId: "rcv", peerId: "peer-rcv", attest: { "peer-srv": 9_000_000 } });
+    s = await fetch(`http://localhost:${p5}/stats`).then((r) => r.json());
+    check("an unsigned update DROPS signed credit to 0 (no sticky signed flag)", s.signedAttestedBytes, 0);
+    check("...while the raw cross-check follows the latest report", s.attestedByClient.srv, 9_000_000);
+    await new Promise((r) => s5.close(r));
+  }
+
   console.log("\nsigned credit survives eviction monotonically (folded into retired)");
   {
     const before = await stats();
