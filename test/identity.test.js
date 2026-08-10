@@ -16,7 +16,7 @@
  *
  * Usage: node test/identity.test.js     (exit 0 = pass, 1 = fail)
  */
-import { issueIdentity, signReport, verifyReport, canonicalize } from "../server/identity.js";
+import { issueIdentity, signReport, verifyReport, canonicalize, issueCert, verifyCert } from "../server/identity.js";
 
 let failures = 0;
 function check(name, actual, expected) {

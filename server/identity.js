@@ -93,3 +93,28 @@ export function verifyReport(reportObj, sigB64, publicKeyB64) {
     return false;
   }
 }
+
+// TRACKER CERTIFICATION (P2P-0070) — the step that turns "this key HOLDER signed" into "this key was
+// ISSUED by the tracker". The tracker signs the peer's public key with ITS OWN private key; the cert
+// is that signature. A self-minted key has no such cert, so certified credit cannot be earned by an
+// identity the tracker never vouched for — which is what a payable tier requires (possession alone,
+// P2P-0069, does not distinguish one real peer from N self-minted ones).
+//   THREAT (HARD RULE 6): certification binds a key to a tracker-blessed announce. It does NOT stop
+//   a determined attacker who drives N real browsers from obtaining N certs — that needs rate limits
+//   / proof-of-work at issuance, a further step. It raises the cost of a sybil from "free" to "one
+//   tracker round-trip per identity", and lets the server REJECT keys it never issued.
+
+// Sign a peer's public key with the tracker's private key. Returns a base64 cert, or null on bad
+// input. The signed message is the peer pubkey's canonical bytes so the cert is bound to that exact
+// key and nothing else.
+export function issueCert(peerPublicKeyB64, trackerPrivateKeyB64) {
+  if (typeof peerPublicKeyB64 !== "string" || !peerPublicKeyB64) return null;
+  return signReport({ pk: peerPublicKeyB64 }, trackerPrivateKeyB64);
+}
+
+// True iff `certB64` is the tracker's signature over `peerPublicKeyB64`, under the tracker's public
+// key. Reuses verifyReport so it inherits the strict-base64 + exact-length + no-throw guards.
+export function verifyCert(peerPublicKeyB64, certB64, trackerPublicKeyB64) {
+  if (typeof peerPublicKeyB64 !== "string" || !peerPublicKeyB64) return false;
+  return verifyReport({ pk: peerPublicKeyB64 }, certB64, trackerPublicKeyB64);
+}

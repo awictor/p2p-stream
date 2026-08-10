@@ -7,7 +7,7 @@ import path from "path";
 import { networkInterfaces } from "os";
 import { fileURLToPath } from "url";
 import { createHash, randomBytes } from "crypto";
-import { verifyReport } from "./identity.js";
+import { verifyReport, verifyCert } from "./identity.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -117,6 +117,13 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
     return n;
   })();
 
+  // The tracker's PUBLIC key (base64 spki ed25519), from the env. When set, an attestation earns
+  // CERTIFIED credit only if its pubKey carries a `cert` that verifies as the tracker's signature
+  // over that pubKey (P2P-0070) — i.e. the tracker issued the identity, it is not self-minted. When
+  // UNSET (default dev/loopback), no key can be certified and certifiedAttestedBytes stays 0; that
+  // is the honest state, not a silent pass. The tracker never shares its PRIVATE key with metrics.
+  const TRACKER_PUBKEY = process.env.TRACKER_PUBKEY || null;
+
   // Coerce a client-supplied byte field to a finite value in [0, MAX_REPORT_BYTES]. Anything
   // non-numeric, NaN, Infinity, negative, or absurdly large collapses to a safe number rather than
   // poisoning a cumulative total. Clamp (not reject) so an honest report that merely overshoots the
@@ -151,7 +158,7 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   // served and make offloadRatio jump backwards — which would also break the sweep's
   // delta arithmetic and contradict the published numbers. Session totals stay
   // monotonic; only the per-client bookkeeping is reclaimed.
-  const retired = { httpBytes: 0, p2pBytes: 0, uploadBytes: 0, count: 0, attestedUploadBytes: 0, signedAttestedBytes: 0 };
+  const retired = { httpBytes: 0, p2pBytes: 0, uploadBytes: 0, count: 0, attestedUploadBytes: 0, signedAttestedBytes: 0, certifiedAttestedBytes: 0 };
 
   // RECEIVER-ATTESTED UPLOAD. `uploadBytes` above is what a viewer claims about ITSELF, which a
   // modified client forges in one line — so the ad-free-for-relay tier cannot pay out on it.
@@ -179,7 +186,7 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   const peerToClient = new Map();
 
   app.post("/metrics", (req, res) => {
-    const { clientId: rawClientId, httpBytes = 0, p2pBytes = 0, uploadBytes = 0, ts, peerId, attest, pubKey, sig } = req.body || {};
+    const { clientId: rawClientId, httpBytes = 0, p2pBytes = 0, uploadBytes = 0, ts, peerId, attest, pubKey, sig, cert } = req.body || {};
     if (!rawClientId || typeof rawClientId !== "string") return res.status(400).json({ error: "clientId required" });
     // Clamp the clientId LENGTH before it is used as a Map key. An unbounded string is both a
     // memory vector and a way to bloat every /stats response that echoes per-client data.
@@ -213,7 +220,19 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
       //   therefore a stronger cross-check than the raw total, still NOT an authorisation to pay.
       const signed = typeof pubKey === "string" && typeof sig === "string" &&
         verifyReport({ clientId, attest }, sig, pubKey);
-      attestations.set(clientId, { byPeer, lastSeen: now(), signed: signed === true, pubKey: signed ? pubKey : null });
+      // CERTIFIED CREDIT (P2P-0070) — a stricter tier ON TOP of signed. The attestation is certified
+      // only if it is signed AND the report carries a `cert` that verifies as the TRACKER's signature
+      // over this pubKey (verifyCert), i.e. the tracker ISSUED this identity. A self-minted key has
+      // no such cert, so it can be `signed` (possession) but never `certified` (distinctness). With
+      // no TRACKER_PUBKEY configured, nothing is certifiable and this stays false — the honest state.
+      const certified = signed && TRACKER_PUBKEY && typeof cert === "string" &&
+        verifyCert(pubKey, cert, TRACKER_PUBKEY);
+      attestations.set(clientId, {
+        byPeer, lastSeen: now(),
+        signed: signed === true,
+        certified: certified === true,
+        pubKey: signed ? pubKey : null,
+      });
     }
     // Recency is stamped SERVER-SIDE, not taken from the client. Trusting `ts` meant a
     // report without one got lastSeen=0, and the `c.lastSeen &&` guards below then
@@ -294,6 +313,7 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
         for (const bytes of Object.values(a.byPeer)) {
           retired.attestedUploadBytes += bytes;
           if (a.signed) retired.signedAttestedBytes += bytes;
+          if (a.certified) retired.certifiedAttestedBytes += bytes;
         }
         attestations.delete(id);
       }
@@ -313,6 +333,10 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
     // verifying signature (P2P-0069). This is the number a payable tier would use; the gap between
     // it and attestedTotal is exactly the unsigned/unauthenticated credit.
     let signedAttestedTotal = retired.signedAttestedBytes;
+    // CERTIFIED credit: signed AND the pubKey was tracker-issued (P2P-0070). The subset of signed
+    // credit that is safe against self-minted-identity collusion. This is the number a payable tier
+    // may actually use once tracker issuance is live.
+    let certifiedAttestedTotal = retired.certifiedAttestedBytes;
     // Who vouched for whom, and how much each one vouched. Needed for the K-of-N filter below:
     // a raw sum cannot tell "20 receivers each saw 1MB" from "one receiver claims 20MB".
     const vouchers = new Map();   // creditedKey -> Map(attesterId -> bytes)
@@ -322,7 +346,8 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
         const servedBy = m && m.clientId;
         if (servedBy && servedBy === attestingId) continue;   // self-attestation, ignored
         attestedTotal += bytes;
-        if (a.signed) signedAttestedTotal += bytes;           // only signed credit is payable-grade
+        if (a.signed) signedAttestedTotal += bytes;           // signed = key possession proven
+        if (a.certified) certifiedAttestedTotal += bytes;     // certified = tracker-issued identity
         const key = servedBy || `unmapped:${pid}`;
         attestedByClient[key] = (attestedByClient[key] || 0) + bytes;
         if (!vouchers.has(key)) vouchers.set(key, new Map());
@@ -375,6 +400,12 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
       // NOTE: a verifying signature proves key possession, NOT tracker-vouched identity (P2P-0070),
       // so signed credit still does not close COLLUSION — never a payout basis on its own.
       signedAttestedBytes: signedAttestedTotal,
+      // CERTIFIED tier (P2P-0070): signed AND tracker-issued pubKey. The gap signedAttestedBytes -
+      // certifiedAttestedBytes is credit from keys the tracker never vouched for (self-minted). Only
+      // this figure is collusion-resistant enough to consider paying — and only once live tracker
+      // issuance (P2P-0071) mints certs at announce; today it is 0 unless TRACKER_PUBKEY is set.
+      certifiedAttestedBytes: certifiedAttestedTotal,
+      trackerCertRequired: !!TRACKER_PUBKEY,
       // K-of-N FILTERED credit, reported ALONGSIDE the raw figure rather than replacing it. The gap
       // between them is the point: a large drop means credit was resting on too few witnesses or on
       // one voucher claiming too much. Hiding the raw number would hide that signal.
