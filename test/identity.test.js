@@ -96,6 +96,32 @@ console.log("\nkey reuse across reports is fine (one identity signs many reports
   check("but s1 does not verify r2 (sig is bound to content)", verifyReport(r2, s1, publicKey), false);
 }
 
+console.log("\nSIGNATURE MALLEABILITY: base64 junk appended to a valid sig must NOT verify (iter 94)");
+{
+  // Node's base64 decoder stops at the last complete quad and drops trailing bytes, so `sig+"AA"`
+  // decoded to the same 64 bytes and USED to verify. An ed25519 sig is exactly 64 bytes; enforce it.
+  const { publicKey, privateKey } = issueIdentity();
+  const sig = signReport(REPORT, privateKey);
+  checkTrue("the clean sig verifies", verifyReport(REPORT, sig, publicKey));
+  for (const suffix of ["A", "AA", "AAAA", "==", "garbage"]) {
+    check(`sig + ${JSON.stringify(suffix)} is REJECTED`, verifyReport(REPORT, sig + suffix, publicKey), false);
+  }
+  // A truncated sig (fewer than 64 bytes) is also rejected.
+  check("a truncated sig is rejected", verifyReport(REPORT, sig.slice(0, 40), publicKey), false);
+  // A garbage-suffixed PUBLIC KEY is rejected too (spki ed25519 is exactly 44 bytes).
+  check("pubkey + garbage is rejected", verifyReport(REPORT, sig, publicKey + "garbage"), false);
+}
+
+console.log("\nSHAPE: an array report is not a valid report (confusable with a keyed object)");
+{
+  const { publicKey, privateKey } = issueIdentity();
+  check("signing an array returns null", signReport([1, 2, 3], privateKey), null);
+  check("signing a scalar returns null", signReport(42, privateKey), null);
+  // Even if some other path produced a sig, verifying an array report is false.
+  const objSig = signReport({ a: 1 }, privateKey);
+  check("verifying an array report -> false", verifyReport([1, 2, 3], objSig, publicKey), false);
+}
+
 console.log("\nmalformed / empty inputs return false or null, never throw");
 {
   check("verify with empty sig -> false", verifyReport(REPORT, "", "x"), false);

@@ -44,6 +44,9 @@ export function canonicalize(obj) {
 export function signReport(reportObj, privateKeyB64) {
   try {
     if (typeof privateKeyB64 !== "string" || !privateKeyB64) return null;
+    // A report is a keyed object, never an array or scalar — reject the confusable shapes so a
+    // signature is only ever produced over the object form verifyReport also demands.
+    if (reportObj === null || typeof reportObj !== "object" || Array.isArray(reportObj)) return null;
     const key = createPrivateKey({ key: Buffer.from(privateKeyB64, "base64"), type: "pkcs8", format: "der" });
     const msg = Buffer.from(canonicalize(reportObj), "utf8");
     return cryptoSign(null, msg, key).toString("base64"); // null algo => implied by the ed25519 key
@@ -52,17 +55,40 @@ export function signReport(reportObj, privateKeyB64) {
   }
 }
 
+// An ed25519 detached signature is EXACTLY 64 bytes. Node's base64 decoder silently stops at the
+// last complete quad and drops trailing junk, so `sig + "garbage"` decodes to the same 64 bytes and
+// would verify — signature MALLEABILITY (iter 94 HARDEN). Enforce the exact byte length so a padded
+// or mutated signature is rejected. Same for the key: an ed25519 spki public key is exactly 44
+// bytes, so a garbage-suffixed key cannot slip through either.
+const ED25519_SIG_BYTES = 64;
+const ED25519_SPKI_PUBKEY_BYTES = 44;
+
+// STRICT base64 decode: node's decoder silently drops trailing junk after the last complete quad,
+// so `sig + "A"` and `sig + "garbage"` decode to the SAME bytes as `sig` (signature malleability).
+// Decode, then re-encode and require it to round-trip to the exact input — anything with dropped
+// or altered characters fails. Returns the Buffer, or null if the input is not clean base64.
+function strictB64(str) {
+  const buf = Buffer.from(str, "base64");
+  return buf.toString("base64") === str ? buf : null;
+}
+
 // Verify a base64 detached signature over a report's canonical bytes under a base64 public key.
-// Returns a strict boolean. ANY malformed input (bad key, bad sig, non-object report) returns
-// FALSE, never throws — an exception on a public endpoint is a DoS and a false-negative risk.
+// Returns a strict boolean. ANY malformed input (bad key, bad sig, non-object report, wrong-length
+// sig/key) returns FALSE, never throws — an exception on a public endpoint is a DoS and a
+// false-negative risk. A report that is an ARRAY is rejected: a signed report is a keyed object,
+// and treating an array as a report invites shape confusion.
 export function verifyReport(reportObj, sigB64, publicKeyB64) {
   try {
     if (typeof sigB64 !== "string" || !sigB64) return false;
     if (typeof publicKeyB64 !== "string" || !publicKeyB64) return false;
-    if (reportObj === null || typeof reportObj !== "object") return false;
-    const key = createPublicKey({ key: Buffer.from(publicKeyB64, "base64"), type: "spki", format: "der" });
+    if (reportObj === null || typeof reportObj !== "object" || Array.isArray(reportObj)) return false;
+    const sig = strictB64(sigB64);
+    if (!sig || sig.length !== ED25519_SIG_BYTES) return false; // reject padded/mutated/short sigs
+    const pub = strictB64(publicKeyB64);
+    if (!pub || pub.length !== ED25519_SPKI_PUBKEY_BYTES) return false;
+    const key = createPublicKey({ key: pub, type: "spki", format: "der" });
     const msg = Buffer.from(canonicalize(reportObj), "utf8");
-    return cryptoVerify(null, msg, key, Buffer.from(sigB64, "base64")) === true;
+    return cryptoVerify(null, msg, key, sig) === true;
   } catch {
     return false;
   }
