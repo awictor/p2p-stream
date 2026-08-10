@@ -118,3 +118,37 @@ export function verifyCert(peerPublicKeyB64, certB64, trackerPublicKeyB64) {
   if (typeof peerPublicKeyB64 !== "string" || !peerPublicKeyB64) return false;
   return verifyReport({ pk: peerPublicKeyB64 }, certB64, trackerPublicKeyB64);
 }
+
+// PROOF-OF-DELIVERY RECEIPT (P2P-0072) — a receiver's signature over a SPECIFIC segment transfer,
+// not a bulk self-attestation. A receipt names (segmentId, bytes, senderPeerId, receiverPeerId), so
+// credit reflects a transfer two parties can corroborate at the segment level. The receiver signs
+// with ITS key; the metrics server (P2P-0073) will credit only receipts whose signer is CERTIFIED.
+//   REQUIRED SHAPE: all four fields present and typed, so a receipt cannot be forged by omission and
+//   cannot be confused with a generic signed report. Anything else -> not a receipt.
+const RECEIPT_FIELDS = ["segmentId", "bytes", "senderPeerId", "receiverPeerId"];
+function isReceiptShape(r) {
+  if (r === null || typeof r !== "object" || Array.isArray(r)) return false;
+  // Exactly the four fields — no more (an extra field would ride along unsigned-in-spirit), no less.
+  const keys = Object.keys(r);
+  if (keys.length !== RECEIPT_FIELDS.length) return false;
+  for (const f of RECEIPT_FIELDS) if (!(f in r)) return false;
+  if (typeof r.segmentId !== "string" || !r.segmentId) return false;
+  if (typeof r.senderPeerId !== "string" || !r.senderPeerId) return false;
+  if (typeof r.receiverPeerId !== "string" || !r.receiverPeerId) return false;
+  if (typeof r.bytes !== "number" || !Number.isFinite(r.bytes) || r.bytes <= 0) return false;
+  return true;
+}
+
+// Sign a delivery receipt. Returns a base64 sig, or null if the receipt is not the required shape or
+// the key is bad (so a malformed receipt is never signed into legitimacy).
+export function signReceipt(receipt, privateKeyB64) {
+  if (!isReceiptShape(receipt)) return null;
+  return signReport(receipt, privateKeyB64);
+}
+
+// Verify a receipt signature. False unless the receipt is the required shape AND the sig verifies —
+// inherits the strict-base64/length/no-throw guards from verifyReport.
+export function verifyReceipt(receipt, sigB64, publicKeyB64) {
+  if (!isReceiptShape(receipt)) return false;
+  return verifyReport(receipt, sigB64, publicKeyB64);
+}
