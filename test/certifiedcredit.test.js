@@ -118,6 +118,29 @@ let clock = 1_700_000_000_000;
     await new Promise((r) => s3.close(r));
   }
 
+  console.log("\ncertified status does NOT persist: an uncertified update drops certified credit (iter 100)");
+  {
+    // Same class as the iter-96 signed-flag guard: attestations.set REPLACES per clientId, so the
+    // latest report governs. A peer that presents a cert once then drops it (or an attacker strips
+    // the cert) must NOT keep certified credit from a stale flag.
+    const p4 = 8174;
+    const s4 = startMetrics(p4, { now: () => clock });
+    await new Promise((r) => setTimeout(r, 300));
+    const post4 = (b) => fetch(`http://localhost:${p4}/metrics`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
+    await post4({ clientId: "srv", peerId: "peer-srv", uploadBytes: 5e6 });
+    const attest = { "peer-srv": 4_000_000 };
+    await post4({ clientId: "rcv", peerId: "peer-rcv", attest, pubKey: rx.publicKey, sig: signReport({ clientId: "rcv", attest }, rx.privateKey), cert });
+    let s = await fetch(`http://localhost:${p4}/stats`).then((r) => r.json());
+    check("certified after the certified report", s.certifiedAttestedBytes, 4_000_000);
+    // Uncertified update (same signed key, NO cert): certified must reset to 0, signed follows latest.
+    const attest2 = { "peer-srv": 9_000_000 };
+    await post4({ clientId: "rcv", peerId: "peer-rcv", attest: attest2, pubKey: rx.publicKey, sig: signReport({ clientId: "rcv", attest: attest2 }, rx.privateKey) });
+    s = await fetch(`http://localhost:${p4}/stats`).then((r) => r.json());
+    check("an uncertified update DROPS certified credit to 0 (no sticky certified flag)", s.certifiedAttestedBytes, 0);
+    check("...while signed follows the latest report", s.signedAttestedBytes, 9_000_000);
+    await new Promise((r) => s4.close(r));
+  }
+
   console.log(`\n${failures === 0 ? "PASS" : "FAIL"}: ${failures} failing assertion(s)`);
   server.close(() => { process.exitCode = failures === 0 ? 0 : 1; });
 })().catch((e) => {
