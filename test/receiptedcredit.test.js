@@ -112,6 +112,23 @@ function receipt(segmentId, bytes, key = rx.privateKey) {
     check("receiptedBytes is independent of attest", s.receiptedBytes, 200000);
   }
 
+  console.log("\nSELF-RECEIPT: sender==receiver earns 0 (receipt analog of self-attestation, iter 104)");
+  {
+    const { post, stats } = await fresh();
+    // A certified peer signs a receipt where it served ITSELF — a peer minting credit for nobody.
+    const r = { segmentId: "seg-self", bytes: 500000, senderPeerId: "peer-me", receiverPeerId: "peer-me" };
+    await post({ clientId: "me", peerId: "peer-me", pubKey: rx.publicKey, cert,
+      receipts: [{ ...r, sig: signReceipt(r, rx.privateKey) }] });
+    const s = await stats();
+    check("self-receipt (sender==receiver) earns 0 receipted", s.receiptedBytes, 0);
+    // A DISTINCT sender/receiver on the same certified key still earns — confirms the guard is the
+    // self-equality, not the key.
+    const { post: p2, stats: s2 } = await fresh();
+    const r2 = { segmentId: "seg-x", bytes: 500000, senderPeerId: "peer-A", receiverPeerId: "peer-B" };
+    await p2({ clientId: "rcv", peerId: "peer-B", pubKey: rx.publicKey, cert, receipts: [{ ...r2, sig: signReceipt(r2, rx.privateKey) }] });
+    check("distinct sender/receiver still earns", (await s2()).receiptedBytes, 500000);
+  }
+
   console.log("\ndedup: the same segmentId listed twice counts once");
   {
     const { post, stats } = await fresh();

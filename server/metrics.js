@@ -263,7 +263,12 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
         if (r.segmentId in kept) continue;
         const rSig = r.sig;
         const receiptObj = { segmentId: r.segmentId, bytes: r.bytes, senderPeerId: r.senderPeerId, receiverPeerId: r.receiverPeerId };
-        const ok = certifiedKey && typeof rSig === "string" && verifyReceipt(receiptObj, rSig, pubKey);
+        // A delivery is between two DISTINCT peers. A self-receipt (sender == receiver) is the
+        // receipt analog of self-attestation — a peer minting credit for "serving itself" — and is
+        // rejected for the same reason the attest path drops self-attestation. Without this a
+        // certified peer earns unbounded receiptedBytes from receipts to nobody. (iter 104)
+        const selfReceipt = r.senderPeerId === r.receiverPeerId;
+        const ok = !selfReceipt && certifiedKey && typeof rSig === "string" && verifyReceipt(receiptObj, rSig, pubKey);
         // Store the clamped byte figure; only a verified receipt gets nonzero credit.
         kept[r.segmentId] = { bytes: ok ? sanitizeBytes(r.bytes) : 0, verified: ok === true };
         n += 1;
