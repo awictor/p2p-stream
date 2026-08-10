@@ -32,13 +32,30 @@ export function hostFingerprint(ip, salt = HOST_SALT) {
 // instead of sleeping for real seconds. Production always uses Date.now.
 export function startMetrics(port, { now = () => Date.now() } = {}) {
   const app = express();
-  app.use(express.json());
+  // Bound the request body. /metrics is PUBLIC and UNAUTHENTICATED; a real report (even with the
+  // MAX_ATTEST_KEYS-capped attest map) is a few KB, so express.json's 100KB default is ~100x too
+  // generous and is free memory/bandwidth an attacker can spend. 16KB is comfortable headroom.
+  const BODY_LIMIT = process.env.METRICS_BODY_LIMIT || "16kb";
+  app.use(express.json({ limit: BODY_LIMIT }));
   // Viewers live on a different origin (static web host); allow the POST.
   app.use((req, res, next) => {
     res.set("Access-Control-Allow-Origin", "*");
     res.set("Access-Control-Allow-Headers", "Content-Type");
     if (req.method === "OPTIONS") return res.sendStatus(204);
     next();
+  });
+  // QUIET body-parser errors. A malformed JSON body or an over-limit payload otherwise dumps a full
+  // stack trace to stderr on every hit — that both leaks internal file paths and is a log-flood
+  // vector on an unauthenticated endpoint (an attacker POSTs garbage in a loop). Answer with the
+  // right status and ONE terse line, no trace. `err.type` is set by body-parser
+  // ("entity.parse.failed" / "entity.too.large"); `err.status` carries 400/413.
+  app.use((err, req, res, next) => {
+    if (err && (err.type === "entity.parse.failed" || err.type === "entity.too.large" || err.status === 400 || err.status === 413)) {
+      const code = err.status || 400;
+      console.warn(`[metrics] rejected ${req.method} ${req.url}: ${err.type || "bad request"} (${code})`);
+      return res.status(code).json({ error: err.type || "bad request" });
+    }
+    return next(err);
   });
 
   // clientId -> latest cumulative counters + lastSeen (ms epoch, stamped SERVER-SIDE).
