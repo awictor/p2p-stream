@@ -533,6 +533,46 @@ loopback path, so the numbers show the mesh, the scaling shape, and the accounti
 not what a network with genuine RTT, packet loss, and asymmetric home uplinks would give. A
 two-machine run is the next credibility step; see [Running across two machines](#running-across-two-machines).
 
+## Authenticated relay credit & ad-free entitlement
+
+The offload numbers above prove the *bandwidth* saving. The other half of the product is the
+value exchange that makes viewers relay in the first place: **a relaying viewer trades its upload
+for ad-free time.** That reward is only honest if the upload it rewards cannot be forged — an
+unauthenticated `peerId` (`prefix + Math.random()`) lets one process mint identities and claim
+credit for bytes it never served (the sybil attack demonstrated against our own detector — see
+[SECURITY.md](SECURITY.md)). So credit is earned up a ladder of increasing trust, and only the
+top rung is allowed to pay anything.
+
+**The credit ladder** — each tier is a strict subset of the one below it, all four exposed on
+`/stats`:
+
+| Tier | What it means | Forgeable by |
+|------|---------------|--------------|
+| **attested** | a peer *claims* it served bytes to another peer | anyone (a bare claim) |
+| **signed** | the claim carries an ed25519 signature the claimant can produce | anyone with a keypair (keys are free) |
+| **certified** | the signing key carries a tracker-issued certificate | anyone the tracker issues a cert to |
+| **receipted** | the *receiver* signed a per-segment receipt, sender ≠ receiver | only a colluding ring of certified peers |
+
+Only **receiptedBytes** — certified, per-segment-corroborated, non-self — is payout-grade.
+Attested/signed/certified numbers are shown for legibility but are **never** the basis for a
+reward. `server/identity.js` holds the crypto (canonical serialization, strict-base64 round-trip
+against signature malleability, exact-length key/sig guards); `server/tracker.js` issues certs
+(`POST /issue`); `server/metrics.js` verifies every rung and drops self-dealing (a self-attestation
+where `servedBy == attester`, a self-receipt where `senderPeerId == receiverPeerId`).
+
+**Ad-free entitlement** is a pure policy function, `earnedEntitlement(receiptedBytes, policy)` in
+`server/entitlement.js`: it turns receiptedBytes — and *only* receiptedBytes — into ad-free
+seconds at an operator-set rate (`AD_FREE_BYTES_PER_SECOND`, default 1 MB/s), floored and
+optionally capped, 0 on 0. `/stats` exposes `entitlementByClient` and `entitlementSeconds`; the
+dashboard renders an "Ad-free earned" card. This is a **LIVE snapshot** of what active relayers
+are owed, not a cumulative balance.
+
+> **This reports what is OWED, never what is PAID.** There is **no payout rail** — no money, no
+> tokens, no ad-server integration (that needs secrets and payment infra; out of scope, see
+> [SECURITY.md](SECURITY.md)). And it is **not a fraud-proof reward**: N certified peers can still
+> collude on mutual receipts, so entitlement is an *upper bound on a legitimate reward*, not an
+> authorization to pay one. The collusion gap is stated, not hidden.
+
 ## Running across two machines
 
 On the host, one command. It waits for the playlist to actually fill, then prints the LAN address
