@@ -8,6 +8,7 @@ import { networkInterfaces } from "os";
 import { fileURLToPath } from "url";
 import { createHash, randomBytes } from "crypto";
 import { verifyReport, verifyCert, verifyReceipt } from "./identity.js";
+import { earnedEntitlement, DEFAULT_BYTES_PER_AD_FREE_SECOND } from "./entitlement.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -160,6 +161,11 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   // monotonic; only the per-client bookkeeping is reclaimed.
   const retired = { httpBytes: 0, p2pBytes: 0, uploadBytes: 0, count: 0, attestedUploadBytes: 0, signedAttestedBytes: 0, certifiedAttestedBytes: 0, receiptedBytes: 0 };
   const MAX_RECEIPTS = posIntEnv("MAX_RECEIPTS", 256); // cap receipts per report, like MAX_ATTEST_KEYS
+  // Ad-free entitlement policy (P2P-0075): bytes a relayer must serve per one ad-free second.
+  // Entitlement is computed ONLY from receiptedBytes (the collusion-resistant tier), so it reports
+  // what a viewer is OWED, never what is PAID — the payout rail is out of scope. Env-overridable +
+  // documented; a garbage value falls back to the default inside earnedEntitlement.
+  const AD_FREE_BYTES_PER_SECOND = Number(process.env.AD_FREE_BYTES_PER_SECOND) || DEFAULT_BYTES_PER_AD_FREE_SECOND;
 
   // RECEIVER-ATTESTED UPLOAD. `uploadBytes` above is what a viewer claims about ITSELF, which a
   // modified client forges in one line — so the ad-free-for-relay tier cannot pay out on it.
@@ -388,8 +394,23 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
     let certifiedAttestedTotal = retired.certifiedAttestedBytes;
     // Proof-of-delivery total: verified receipts from certified keys, per-segment corroborated.
     let receiptedTotal = retired.receiptedBytes;
-    for (const rc of receiptsByClient.values()) {
-      for (const r of Object.values(rc.receipts)) if (r.verified) receiptedTotal += r.bytes;
+    // Per-CLIENT receipted bytes, so entitlement can be attributed to the viewer that earned it.
+    // Live snapshot of currently-tracked receipts (a departed peer's bytes fold into the retired
+    // TOTAL but cannot be shown an entitlement — it is gone). Only VERIFIED receipts count.
+    const receiptedByClient = {};
+    for (const [id, rc] of receiptsByClient) {
+      let sum = 0;
+      for (const r of Object.values(rc.receipts)) if (r.verified) sum += r.bytes;
+      receiptedTotal += sum;
+      if (sum > 0) receiptedByClient[id] = sum;
+    }
+    // ENTITLEMENT (P2P-0075): ad-free seconds OWED per client, from receiptedBytes ONLY — never
+    // attested/signed/certified-without-receipt. Reports what is owed, not paid (no payout rail).
+    const entitlementByClient = {};
+    let entitlementSeconds = 0;
+    for (const [id, sum] of Object.entries(receiptedByClient)) {
+      const secs = earnedEntitlement({ receiptedBytes: sum, bytesPerSecond: AD_FREE_BYTES_PER_SECOND });
+      if (secs > 0) { entitlementByClient[id] = secs; entitlementSeconds += secs; }
     }
     // Who vouched for whom, and how much each one vouched. Needed for the K-of-N filter below:
     // a raw sum cannot tell "20 receivers each saw 1MB" from "one receiver claims 20MB".
@@ -464,6 +485,13 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
       // attest. Still NOT a QoE proof (delivered != played) and collusion via N certified keys
       // remains open. 0 unless TRACKER_PUBKEY is set (nothing certifiable => no receipted credit).
       receiptedBytes: receiptedTotal,
+      // AD-FREE ENTITLEMENT (P2P-0075): ad-free seconds OWED, per client and in total, computed from
+      // receiptedBytes ONLY. This is what a relaying viewer EARNED — NOT what has been paid (there is
+      // no payout rail; that needs ad-server/token integration, out of loop scope). The policy rate
+      // is echoed so the figure can never be read without its basis.
+      entitlementByClient,
+      entitlementSeconds,
+      adFreeBytesPerSecond: AD_FREE_BYTES_PER_SECOND,
       trackerCertRequired: !!TRACKER_PUBKEY,
       // K-of-N FILTERED credit, reported ALONGSIDE the raw figure rather than replacing it. The gap
       // between them is the point: a large drop means credit was resting on too few witnesses or on
