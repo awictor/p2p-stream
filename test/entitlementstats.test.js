@@ -102,6 +102,49 @@ function receipt(segmentId, bytes) {
     check("but entitlement floors to 0", s.entitlementSeconds, 0);
   }
 
+  console.log("\nentitlementSeconds == sum(entitlementByClient), and multi-peer attributes correctly (iter 108)");
+  {
+    // Two distinct certified receivers. The total must equal the sum of the per-client parts — a
+    // dashboard/payout reading either must never disagree with the other.
+    const { post, stats } = await fresh();
+    const rxB = issueIdentity();
+    const certB = issueCert(rxB.publicKey, tracker.privateKey);
+    const mkFor = (priv, seg, bytes, receiver) => {
+      const r = { segmentId: seg, bytes, senderPeerId: "peer-A", receiverPeerId: receiver };
+      return { ...r, sig: signReceipt(r, priv) };
+    };
+    await post({ clientId: "rcvA", peerId: "peer-rcvA", pubKey: rx.publicKey, cert, receipts: [mkFor(rx.privateKey, "a1", 3_000_000, "peer-rcvA")] });
+    await post({ clientId: "rcvB", peerId: "peer-rcvB", pubKey: rxB.publicKey, cert: certB, receipts: [mkFor(rxB.privateKey, "b1", 2_000_000, "peer-rcvB")] });
+    const s = await stats();
+    check("rcvA earns 3s", s.entitlementByClient.rcvA, 3);
+    check("rcvB earns 2s", s.entitlementByClient.rcvB, 2);
+    check("total == sum of parts", s.entitlementSeconds, Object.values(s.entitlementByClient).reduce((a, b) => a + b, 0));
+    check("...and equals 5", s.entitlementSeconds, 5);
+  }
+
+  console.log("\nentitlement is a LIVE snapshot: stale receipts drop it, receiptedBytes stays (iter 108)");
+  {
+    // Distinct clock so eviction is deterministic. After EVICT the peer's receipts fold into the
+    // retired receiptedBytes TOTAL (monotonic) but it can no longer be shown an entitlement — it is
+    // gone. This is the documented cumulative-total vs live-snapshot distinction; pin it so a
+    // refactor that made entitlement cumulative (double-crediting a returning peer) is caught.
+    let clk = 1_700_000_000_000;
+    const p = 8318;
+    const srv = startMetrics(p, { now: () => clk });
+    servers.push(srv);
+    await new Promise((r) => setTimeout(r, 250));
+    const post = (b) => fetch(`http://localhost:${p}/metrics`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
+    const st = () => fetch(`http://localhost:${p}/stats`).then((r) => r.json());
+    await post({ clientId: "rcv", peerId: "peer-rcv", pubKey: rx.publicKey, cert, receipts: [receipt("s1", 5_000_000)] });
+    let s = await st();
+    check("live entitlement is 5", s.entitlementSeconds, 5);
+    clk += 15000 * 20 + 1; // > EVICT_MS
+    await post({ clientId: "poke", httpBytes: 1 }); // trigger the aggregate sweep
+    s = await st();
+    check("after eviction entitlement drops to 0 (departed peer, no phantom)", s.entitlementSeconds, 0);
+    checkTrue("but receiptedBytes stays (retired total is monotonic)", s.receiptedBytes >= 5_000_000);
+  }
+
   for (const s of servers) { try { s.close(); } catch { /* ignore */ } }
   console.log(`\n${failures === 0 ? "PASS" : "FAIL"}: ${failures} failing assertion(s)`);
   process.exitCode = failures === 0 ? 0 : 1;
