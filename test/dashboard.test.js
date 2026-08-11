@@ -31,7 +31,7 @@ function loadDashboard(stats) {
   const m = HTML.match(/<script>([\s\S]*?)<\/script>/);
   if (!m) throw new Error("no inline <script> found in dashboard.html");
   const els = {};
-  const ids = ["offload", "bar", "viewers", "http", "p2p", "upload", "hosts", "tracked", "loopwarn"];
+  const ids = ["offload", "bar", "viewers", "http", "p2p", "upload", "hosts", "tracked", "loopwarn", "entitlement", "entbasis"];
   for (const id of ids) els[id] = { textContent: "", style: {}, className: "" };
 
   const captured = {};
@@ -114,6 +114,32 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     check("missing distinctHosts -> placeholder, not 'undefined'/'NaN'", missing.els.hosts.textContent, "—");
     check("loopwarn HIDDEN when hosts is unknown (no false loopback)", missing.els.loopwarn.className.includes("show"), false);
     check("tracked placeholder when absent", missing.els.tracked.textContent, "—");
+  }
+
+  console.log("\nad-free earned: entitlementSeconds rendered mm:ss, with the receipted basis (iter 109):");
+  {
+    // 125s -> 2:05; trackerCertRequired shows the receiptedBytes basis.
+    const earned = loadDashboard({
+      viewers: 2, httpBytes: 1e6, p2pBytes: 3e6, uploadBytes: 3e6, offloadRatio: 0.75,
+      entitlementSeconds: 125, receiptedBytes: 125e6, trackerCertRequired: true,
+    });
+    await earned.tick();
+    check("entitlement renders as mm:ss", earned.els.entitlement.textContent, "2:05");
+    check("basis names the receipted bytes when certs required", earned.els.entbasis.textContent.includes("receipted"), true);
+
+    // Past an hour -> h:mm:ss.
+    const big = loadDashboard({ entitlementSeconds: 3725, receiptedBytes: 1e9, trackerCertRequired: true, offloadRatio: 0 });
+    await big.tick();
+    check("over an hour renders h:mm:ss", big.els.entitlement.textContent, "1:02:05");
+
+    // 0 / absent entitlement -> "0:00", never "undefined"/"NaN"; no cert => no basis line.
+    const none = loadDashboard({ viewers: 1, httpBytes: 1e6, p2pBytes: 0, uploadBytes: 0, offloadRatio: 0 });
+    await none.tick();
+    check("absent entitlement -> 0:00 (not undefined/NaN)", none.els.entitlement.textContent, "0:00");
+    check("no cert required -> basis line empty", none.els.entbasis.textContent, "");
+    const zero = loadDashboard({ entitlementSeconds: 0, trackerCertRequired: true, receiptedBytes: 0, offloadRatio: 0 });
+    await zero.tick();
+    check("zero entitlement -> 0:00", zero.els.entitlement.textContent, "0:00");
   }
 
   console.log("\nedge ratios round correctly (the headline number):");

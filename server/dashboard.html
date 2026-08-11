@@ -42,6 +42,9 @@
     <div class="card"><div class="label">Origin (HTTP) bytes</div><div class="val" id="http">0</div></div>
     <div class="card"><div class="label">P2P download bytes</div><div class="val" id="p2p">0</div></div>
     <div class="card"><div class="label">P2P upload bytes</div><div class="val" id="upload">0</div></div>
+    <div class="card"><div class="label">Ad-free earned <small>(mm:ss, from receipts)</small></div>
+      <div class="val" id="entitlement">0:00</div>
+      <div><small id="entbasis"></small></div></div>
   </div>
   <p><small>Upload is what relaying viewers PAID to produce the saving above. The harness
     (<code>npm run verify</code>) also reports rebuffers and latency — a savings figure should
@@ -63,6 +66,15 @@
     // A DOM write that tolerates a missing element, so adding a /stats field the page does not yet
     // render (or a test stub without that id) never throws and kills the whole tick.
     const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    // Seconds -> mm:ss (or h:mm:ss past an hour). Junk/negative/NaN -> "0:00", same fail-safe as
+    // fmt(): a "NaN:NaN" on a reward figure reads as broken, worse than an honest zero.
+    const fmtDuration = (s) => {
+      s = Math.floor(Number(s));
+      if (!Number.isFinite(s) || s <= 0) return "0:00";
+      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+      const mm = h > 0 ? String(m).padStart(2, "0") : String(m);
+      return (h > 0 ? h + ":" : "") + mm + ":" + String(sec).padStart(2, "0");
+    };
     async function tick() {
       try {
         const s = await (await fetch("/stats")).json();
@@ -73,6 +85,14 @@
         setText("http", fmt(s.httpBytes));
         setText("p2p", fmt(s.p2pBytes));
         setText("upload", fmt(s.uploadBytes));
+
+        // Ad-free EARNED (P2P-0076): entitlementSeconds is what relaying viewers earned, computed
+        // server-side from receiptedBytes ONLY (the collusion-resistant tier). This is OWED, not
+        // PAID. When the tracker requires certs, show the receiptedBytes basis so the figure is
+        // legible; when it does not (no TRACKER_PUBKEY), entitlement is 0 and the basis line stays
+        // empty rather than implying a reward path that is not wired.
+        setText("entitlement", fmtDuration(s.entitlementSeconds));
+        setText("entbasis", s.trackerCertRequired ? ("from " + fmt(s.receiptedBytes) + " receipted") : "");
 
         // Trust signals shipped to /stats at iters 73/75. hosts answers "is this real or loopback";
         // tracked/max answers "is the swarm near its ceiling or under a flood".
