@@ -187,7 +187,19 @@ function leadingZeroBits(buf) {
   return count;
 }
 
-// True iff sha256(challenge + nonce) has at least `bits` leading zero bits.
+// The hashed message is LENGTH-PREFIXED, not a bare `challenge + nonce` concatenation. Naive
+// concatenation is ambiguous when the nonce is attacker-controlled: sha256("ab"+"c") ===
+// sha256("a"+"bc"), so ONE solved digest would satisfy MULTIPLE (challenge, nonce) pairs, and a
+// solution mined against a short challenge could be replayed against a differently-split one. By
+// prefixing the challenge's length, the boundary between challenge and nonce is pinned regardless of
+// what the nonce contains, so a proof is bound to exactly one challenge. (iter 114 HARDEN.)
+function powDigest(challenge, nonce) {
+  return createHash("sha256")
+    .update(String(challenge.length) + ":" + challenge + nonce)
+    .digest();
+}
+
+// True iff the length-prefixed hash of (challenge, nonce) has at least `bits` leading zero bits.
 //   bits <= 0  -> ALWAYS true (the off switch — issuance PoW disabled, back-compat default).
 //   Any non-string challenge/nonce, or a non-finite/negative-after-flooring bits, -> false (no throw:
 //   this runs in a request handler on a public endpoint). bits is floored so "8.9" means 8, not a
@@ -198,8 +210,7 @@ export function verifyPow(challenge, nonce, bits) {
     if (!Number.isFinite(target)) return false;
     if (target <= 0) return true; // disabled
     if (typeof challenge !== "string" || typeof nonce !== "string") return false;
-    const digest = createHash("sha256").update(challenge + nonce).digest();
-    return leadingZeroBits(digest) >= target;
+    return leadingZeroBits(powDigest(challenge, nonce)) >= target;
   } catch {
     return false;
   }
@@ -214,8 +225,7 @@ export function solvePow(challenge, bits, maxTries = 1 << 24) {
   if (typeof challenge !== "string") return null;
   for (let i = 0; i < maxTries; i++) {
     const nonce = i.toString(16);
-    const digest = createHash("sha256").update(challenge + nonce).digest();
-    if (leadingZeroBits(digest) >= target) return nonce;
+    if (leadingZeroBits(powDigest(challenge, nonce)) >= target) return nonce;
   }
   return null;
 }

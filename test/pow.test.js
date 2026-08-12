@@ -28,10 +28,11 @@ function checkTrue(name, actual, why = "") {
   console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}${ok ? "" : ` — got falsy${why ? ` (${why})` : ""}`}`);
 }
 
-// A local reference: leading zero bits of sha256(challenge+nonce), computed independently of the
-// module so the test is not just re-asserting the implementation against itself.
+// A local reference: leading zero bits of the LENGTH-PREFIXED hash (see powDigest in identity.js —
+// the prefix pins the challenge/nonce boundary so a nonce cannot shift it), computed independently
+// of the module so the test is not just re-asserting the implementation against itself.
 function refLeadingZeroBits(challenge, nonce) {
-  const d = createHash("sha256").update(challenge + nonce).digest();
+  const d = createHash("sha256").update(String(challenge.length) + ":" + challenge + nonce).digest();
   let n = 0;
   for (const byte of d) {
     if (byte === 0) { n += 8; continue; }
@@ -87,6 +88,25 @@ console.log("\nno-throw on garbage input (public-endpoint safety)");
   check("null nonce -> false", verifyPow("c", null, 8), false);
   check("NaN bits -> false (not a silent pass)", verifyPow("c", "n", NaN), false);
   check("undefined bits -> false", verifyPow("c", "n", undefined), false);
+}
+
+console.log("\nCONCATENATION AMBIGUITY: a proof is bound to ONE challenge/nonce split (iter 114)");
+{
+  // Without a length prefix, ("ab","c") and ("a","bc") hash identically, so one mined digest would
+  // satisfy both splits. Find a nonce for challenge "ab" at a low target, then confirm that moving
+  // the boundary (challenge "a", nonce "b"+nonce) is NOT automatically also valid — the two must be
+  // independent. We assert the digests differ, which is what the length prefix guarantees.
+  const bits = 8;
+  const nonce = solvePow("ab", bits);
+  checkTrue("solved a nonce for challenge 'ab'", typeof nonce === "string");
+  // The shifted split has a DIFFERENT length prefix, so its digest (and thus validity) is unrelated.
+  const validHere = verifyPow("ab", nonce, bits);
+  const validShifted = verifyPow("a", "b" + nonce, bits);
+  checkTrue("proof is valid for its own split", validHere);
+  // Independence: the shifted split's validity is decided by ITS OWN digest, not inherited. Assert
+  // via the reference so we are testing the property, not a coincidence.
+  check("shifted split validity matches its independent digest, not the original's",
+    validShifted, refLeadingZeroBits("a", "b" + nonce) >= bits);
 }
 
 console.log("\nverifyPow is deterministic for the same inputs");
