@@ -15,7 +15,7 @@
  * Usage: node test/issuer.test.js     (exit 0 = pass, 1 = fail)
  */
 import { startIssuer, issueTrackerCert, loadTrackerIdentity } from "../server/tracker.js";
-import { issueIdentity, signReport, verifyCert } from "../server/identity.js";
+import { issueIdentity, signReport, verifyCert, solvePow } from "../server/identity.js";
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -100,6 +100,46 @@ let clock = 1_700_000_000_000;
     const s = await fetch(`http://localhost:${MPORT}/stats`).then((r) => r.json());
     check("signed credit counts", s.signedAttestedBytes, 4_000_000);
     check("certified credit counts — full issuer->metrics chain, no hardcoded cert", s.certifiedAttestedBytes, 4_000_000);
+  }
+
+  console.log("\nPoW-GATED issuance (P2P-0079): bits>0 needs a solved challenge");
+  {
+    // A separate issuer with PoW ON (bits passed explicitly, independent of the env default).
+    const powId = loadTrackerIdentity({});
+    const PPORT = 8204;
+    const POW_BITS = 12; // small enough to solve in <1s, big enough that a wrong nonce fails
+    const powIssuer = startIssuer(PPORT, powId, POW_BITS);
+    servers.push(powIssuer);
+    await new Promise((r) => setTimeout(r, 300));
+    const peerP = issueIdentity();
+    const base = `http://localhost:${PPORT}`;
+    const postIssue = (b) => fetch(`${base}/issue`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
+
+    // GET /issue/challenge advertises the difficulty and hands out a challenge.
+    const ch = await fetch(`${base}/issue/challenge`).then((r) => r.json());
+    check("challenge endpoint reports the difficulty", ch.bits, POW_BITS);
+    checkTrue("challenge endpoint returns a challenge string", typeof ch.challenge === "string" && ch.challenge.length > 0);
+
+    // POST /issue WITHOUT a proof is rejected 400, no cert.
+    const noProof = await postIssue({ pubKey: peerP.publicKey });
+    check("POST /issue without a proof -> 400", noProof.status, 400);
+    checkTrue("...and no cert in the body", (await noProof.json()).cert === undefined);
+
+    // POST /issue WITH a solved nonce mints a verifiable cert.
+    const nonce = solvePow(ch.challenge, POW_BITS);
+    const withProof = await postIssue({ pubKey: peerP.publicKey, challenge: ch.challenge, nonce });
+    check("POST /issue with a valid proof -> 200", withProof.status, 200);
+    checkTrue("...mints a cert that verifies", verifyCert(peerP.publicKey, (await withProof.json()).cert, powId.publicKey));
+
+    // REPLAY: the same solved challenge cannot mint a SECOND cert (single-use).
+    const replay = await postIssue({ pubKey: peerP.publicKey, challenge: ch.challenge, nonce });
+    check("a consumed challenge is single-use (replay -> 400)", replay.status, 400);
+
+    // A challenge we never issued is not honoured even with a 'valid' nonce for it.
+    const forged = "deadbeefdeadbeefdeadbeefdeadbeef";
+    const forgedNonce = solvePow(forged, POW_BITS);
+    const unknown = await postIssue({ pubKey: peerP.publicKey, challenge: forged, nonce: forgedNonce });
+    check("an unknown (never-issued) challenge -> 400", unknown.status, 400);
   }
 
   for (const s of servers) { try { s.close(); } catch { /* ignore */ } }

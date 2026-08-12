@@ -11,11 +11,18 @@ import path from "path";
 import http from "http";
 import { Server } from "bittorrent-tracker";
 import { startMetrics } from "./metrics.js";
-import { issueIdentity, issueCert } from "./identity.js";
+import { issueIdentity, issueCert, makeChallenge, verifyPow } from "./identity.js";
 
 const PORT = Number(process.env.PORT || 8000);
 const METRICS_PORT = Number(process.env.METRICS_PORT || 8001);
 const ISSUER_PORT = Number(process.env.ISSUER_PORT || 8002);
+// Cert-issuance proof-of-work difficulty (leading zero bits). 0 = OFF (default, back-compat): the
+// issuer hands a cert to any pubKey. >0 forces the client to solve a PoW per issuance, pricing a
+// sybil ring in CPU (P2P-0079). Positive-int validated so a garbage env falls back to 0, never NaN.
+const ISSUE_POW_BITS = (() => {
+  const n = Number(process.env.ISSUE_POW_BITS);
+  return Number.isInteger(n) && n > 0 ? n : 0;
+})();
 
 // The tracker's OWN ed25519 identity — the root of the certified-credit chain (P2P-0071). It signs
 // each peer's pubKey (a cert), and the metrics server is configured with only this identity's PUBLIC
@@ -73,14 +80,34 @@ export const TRACKER_CONFIG = {
   // announce (no response, no peer exchange). Omit it to accept all swarms.
 };
 
-// A tiny HTTP issuance endpoint: POST /issue {pubKey} -> {cert, trackerPubKey}. This is how a viewer
-// turns its self-minted keypair into a tracker-certified one before it starts reporting. Kept as a
-// bare http server (not express) to avoid coupling the tracker to the metrics dep, and returned so a
-// test/operator can close it. GET /pubkey exposes the tracker public key for TRACKER_PUBKEY setup.
-//   NOTE (HARD RULE 6): there is NO rate limit or proof-of-work here, so N browsers => N certs. This
-//   binds a key to an issuance event, it does not prove a distinct human. Rate/PoW is a later step.
-export function startIssuer(port, identity) {
+// A tiny HTTP issuance endpoint. Kept as a bare http server (not express) to avoid coupling the
+// tracker to the metrics dep, and returned so a test/operator can close it. Routes:
+//   GET  /pubkey           -> {trackerPubKey}                 (metrics' TRACKER_PUBKEY setup)
+//   GET  /issue/challenge  -> {challenge, bits}               (PoW challenge to solve before issuing)
+//   POST /issue {pubKey}                     when bits==0     -> {cert, trackerPubKey}
+//   POST /issue {pubKey, challenge, nonce}   when bits>0      -> {cert, ...} iff the PoW verifies
+//
+// PoW (P2P-0079): when `powBits` > 0, a cert costs a solved proof, so a certified COLLUSION RING is
+// priced in CPU rather than free. A challenge is SINGLE-USE and bounded (a solved nonce cannot be
+// replayed to mint many certs, and the issuer cannot be memory-flooded by challenge requests).
+//   THREAT (HARD RULE 6): PoW prices issuance in CPU; it does NOT prove a distinct HUMAN (more cores
+//   / an ASIC mint faster) and it is not a rate limit. bits==0 (default) restores the old behaviour:
+//   any pubKey gets a cert. This raises a sybil's cost, it does not eliminate collusion.
+export function startIssuer(port, identity, powBits = ISSUE_POW_BITS) {
   const MAX_BODY = 4096; // a pubKey POST is ~100 bytes; cap hard on this public endpoint
+  const bits = Number.isInteger(powBits) && powBits > 0 ? powBits : 0;
+  // Outstanding unsolved challenges (single-use). Bounded so a flood of GET /issue/challenge cannot
+  // grow this without limit; when full the oldest is evicted (a dropped challenge just fails to
+  // redeem, forcing the client to fetch a fresh one — no cert is issued on an unknown challenge).
+  const MAX_OPEN_CHALLENGES = 4096;
+  const openChallenges = new Set();
+  const rememberChallenge = (c) => {
+    if (openChallenges.size >= MAX_OPEN_CHALLENGES) {
+      const oldest = openChallenges.values().next().value;
+      openChallenges.delete(oldest);
+    }
+    openChallenges.add(c);
+  };
   const server = http.createServer((req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -89,13 +116,30 @@ export function startIssuer(port, identity) {
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ trackerPubKey: identity.publicKey }));
     }
+    if (req.method === "GET" && req.url === "/issue/challenge") {
+      const challenge = makeChallenge();
+      if (bits > 0) rememberChallenge(challenge); // only track when a redemption will check it
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ challenge, bits }));
+    }
     if (req.method === "POST" && req.url === "/issue") {
       let body = "", tooBig = false;
       req.on("data", (c) => { body += c; if (body.length > MAX_BODY) { tooBig = true; req.destroy(); } });
       req.on("end", () => {
         if (tooBig) { res.writeHead(413); return res.end(); }
-        let pubKey;
-        try { pubKey = JSON.parse(body).pubKey; } catch { res.writeHead(400, { "Content-Type": "application/json" }); return res.end(JSON.stringify({ error: "bad json" })); }
+        let parsed;
+        try { parsed = JSON.parse(body); } catch { res.writeHead(400, { "Content-Type": "application/json" }); return res.end(JSON.stringify({ error: "bad json" })); }
+        const { pubKey, challenge, nonce } = parsed || {};
+        // PoW gate (only when enabled). The challenge must be one WE issued (single-use) AND the
+        // nonce must solve it. Consume the challenge FIRST so a valid-but-rejected attempt (e.g. bad
+        // pubKey below) still burns it — a solved proof is worth exactly one issuance attempt.
+        if (bits > 0) {
+          const known = typeof challenge === "string" && openChallenges.delete(challenge);
+          if (!known || !verifyPow(challenge, nonce, bits)) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ error: "invalid or missing proof of work" }));
+          }
+        }
         const cert = issueTrackerCert(pubKey, identity);
         if (!cert) { res.writeHead(400, { "Content-Type": "application/json" }); return res.end(JSON.stringify({ error: "pubKey required" })); }
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -136,6 +180,9 @@ export function startTracker(port = PORT, metricsPort = METRICS_PORT) {
   const identity = loadTrackerIdentity();
   const issuer = startIssuer(ISSUER_PORT, identity);
   console.log(`[tracker] identity issuer on http://localhost:${ISSUER_PORT} (POST /issue, GET /pubkey)`);
+  console.log(ISSUE_POW_BITS > 0
+    ? `[tracker] cert-issuance PoW ENABLED (${ISSUE_POW_BITS} bits) — GET /issue/challenge before POST /issue`
+    : "[tracker] cert-issuance PoW OFF (ISSUE_POW_BITS=0) — any pubKey gets a cert");
   if (identity.generated) {
     console.log("[tracker] GENERATED an ephemeral tracker identity. For certified credit, set the");
     console.log(`[tracker]   metrics server's TRACKER_PUBKEY to: ${identity.publicKey}`);
