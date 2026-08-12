@@ -14,7 +14,7 @@
 // ed25519 chosen: small keys (44-char b64 pubkey), 88-char b64 sigs, and node's crypto signs it
 // with a null algorithm (the algorithm is implied by the key type). Verified round-trip in node 24.
 import { generateKeyPairSync, sign as cryptoSign, verify as cryptoVerify,
-  createPublicKey, createPrivateKey } from "crypto";
+  createPublicKey, createPrivateKey, createHash, randomBytes } from "crypto";
 
 // A fresh ed25519 identity. Keys are returned as base64 DER strings so they are trivially
 // JSON-transportable (a report carries the pubkey; the tracker will later vouch for it). spki for
@@ -151,4 +151,71 @@ export function signReceipt(receipt, privateKeyB64) {
 export function verifyReceipt(receipt, sigB64, publicKeyB64) {
   if (!isReceiptShape(receipt)) return false;
   return verifyReport(receipt, sigB64, publicKeyB64);
+}
+
+// CERT-ISSUANCE PROOF-OF-WORK (P2P-0078) — the primitive that prices identity minting.
+//
+// certification (P2P-0070) raised a sybil's cost from "free" to "one tracker round-trip per key",
+// but the tracker's /issue endpoint still hands a cert to any pubkey for nothing, so a certified
+// COLLUSION RING assembles for free. A PoW gate makes each issuance cost measurable CPU: the client
+// must find a nonce whose hash of (challenge+nonce) has at least `bits` leading zero bits. Solving is
+// O(2^bits) hashes on average; verifying is ONE hash. The tracker will require a valid proof before
+// signing a cert (P2P-0079).
+//   THREAT (HARD RULE 6): PoW prices issuance in CPU. It does NOT prove a distinct HUMAN — an
+//   attacker with more cores or an ASIC still mints faster; and a challenge is only anti-replay if
+//   the issuer makes it single-use and fresh (that binding lives at the endpoint, P2P-0079). This is
+//   a cost multiplier on a collusion ring, not a personhood proof.
+
+// A fresh random challenge (128 bits of entropy, hex). The issuer hands one out per attempt; the
+// client hashes (challenge + nonce) hunting for the difficulty target. randomBytes is CSPRNG, so
+// challenges are unpredictable — a client cannot precompute nonces for a challenge it has not seen.
+export function makeChallenge() {
+  return randomBytes(16).toString("hex");
+}
+
+// Count leading zero BITS in a Buffer (not hex chars — bit granularity so `bits` is a smooth knob).
+function leadingZeroBits(buf) {
+  let count = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const byte = buf[i];
+    if (byte === 0) { count += 8; continue; }
+    // Math.clz32 on a right-shifted byte gives the leading zeros within this byte; the byte occupies
+    // the low 8 bits of a 32-bit int, so subtract the 24 high zero bits clz32 also counts.
+    count += Math.clz32(byte) - 24;
+    break;
+  }
+  return count;
+}
+
+// True iff sha256(challenge + nonce) has at least `bits` leading zero bits.
+//   bits <= 0  -> ALWAYS true (the off switch — issuance PoW disabled, back-compat default).
+//   Any non-string challenge/nonce, or a non-finite/negative-after-flooring bits, -> false (no throw:
+//   this runs in a request handler on a public endpoint). bits is floored so "8.9" means 8, not a
+//   surprise; a fractional target is meaningless at bit granularity.
+export function verifyPow(challenge, nonce, bits) {
+  try {
+    const target = Math.floor(Number(bits));
+    if (!Number.isFinite(target)) return false;
+    if (target <= 0) return true; // disabled
+    if (typeof challenge !== "string" || typeof nonce !== "string") return false;
+    const digest = createHash("sha256").update(challenge + nonce).digest();
+    return leadingZeroBits(digest) >= target;
+  } catch {
+    return false;
+  }
+}
+
+// Convenience for a client/test: brute-force a nonce meeting `bits` for a challenge. Deterministic
+// counter, not randomness, so a test is reproducible. Guarded with a hash ceiling so a mistuned
+// difficulty cannot spin forever — returns null if no nonce is found within `maxTries`.
+export function solvePow(challenge, bits, maxTries = 1 << 24) {
+  const target = Math.floor(Number(bits));
+  if (!Number.isFinite(target) || target <= 0) return "0"; // any nonce works when disabled
+  if (typeof challenge !== "string") return null;
+  for (let i = 0; i < maxTries; i++) {
+    const nonce = i.toString(16);
+    const digest = createHash("sha256").update(challenge + nonce).digest();
+    if (leadingZeroBits(digest) >= target) return nonce;
+  }
+  return null;
 }
