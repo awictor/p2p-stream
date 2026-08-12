@@ -19,10 +19,28 @@ const ISSUER_PORT = Number(process.env.ISSUER_PORT || 8002);
 // Cert-issuance proof-of-work difficulty (leading zero bits). 0 = OFF (default, back-compat): the
 // issuer hands a cert to any pubKey. >0 forces the client to solve a PoW per issuance, pricing a
 // sybil ring in CPU (P2P-0079). Positive-int validated so a garbage env falls back to 0, never NaN.
-const ISSUE_POW_BITS = (() => {
-  const n = Number(process.env.ISSUE_POW_BITS);
-  return Number.isInteger(n) && n > 0 ? n : 0;
-})();
+//   CLAMPED to MAX_POW_BITS: the shipped solver (solvePow, maxTries=1<<24) can only reliably find a
+//   nonce up to ~24 bits; a larger difficulty would BRICK issuance silently (every POST /issue 400s
+//   forever, no cert ever minted). So an over-large env is clamped down and WARNED, never honoured as
+//   an un-meetable target — same fail-safe as the iter-84 MAX_* limits. (iter 120 HARDEN)
+export const MAX_POW_BITS = 24;
+// Pure so a test can drive every branch without mutating process.env. `warn` is injected (defaults to
+// console.warn) so a test can assert the warning fires without capturing global console.
+export function resolvePowBits(raw, warn = (m) => console.warn(m)) {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) {
+    if (raw !== undefined && raw !== "" && raw !== "0" && raw !== 0) {
+      warn(`[tracker] ISSUE_POW_BITS='${raw}' is not a positive integer; PoW stays OFF (0).`);
+    }
+    return 0;
+  }
+  if (n > MAX_POW_BITS) {
+    warn(`[tracker] ISSUE_POW_BITS=${n} exceeds MAX_POW_BITS=${MAX_POW_BITS} (the shipped solver's ceiling); clamping to ${MAX_POW_BITS} so issuance is not bricked.`);
+    return MAX_POW_BITS;
+  }
+  return n;
+}
+const ISSUE_POW_BITS = resolvePowBits(process.env.ISSUE_POW_BITS);
 
 // The tracker's OWN ed25519 identity — the root of the certified-credit chain (P2P-0071). It signs
 // each peer's pubKey (a cert), and the metrics server is configured with only this identity's PUBLIC
