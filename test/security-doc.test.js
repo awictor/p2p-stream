@@ -70,10 +70,32 @@ console.log("\nit distinguishes DEFENDS from DOES-NOT for the shipped guards");
     /socket|remoteAddress/i.test(T) && /body|not the body|not.*client/i.test(T));
 }
 
-console.log("\nit scopes what is explicitly NOT done in this MVP");
+console.log("\nit reflects the SHIPPED auth+PoW defenses (not the pre-iter-68 'we have none') (iter 117)");
 {
-  checkTrue("names authenticated identity as the out-of-scope fix",
-    /authenticat.{0,30}(identity|peer)|tracker-assigned|signed handshake/i.test(T));
+  // The credit ladder shipped (0068-0073): the doc must name the payable-grade rung, not claim the
+  // MVP has no authenticated credit path.
+  checkTrue("names the credit ladder / certified+receipted path",
+    /certified/i.test(T) && /receipted|receipt/i.test(T),
+    "signed<certified<receipted shipped; the doc cannot still say credit rests on the raw peerId");
+  // Cert-issuance PoW shipped (0078-0079): name it and its env knob.
+  checkTrue("names the cert-issuance proof-of-work and ISSUE_POW_BITS",
+    /proof(?:\s|-)?of(?:\s|-)?work|\bpow\b/i.test(T) && /ISSUE_POW_BITS/.test(T),
+    "PoW-priced issuance shipped; a threat doc that omits a shipped defense understates it");
+  // GUARD AGAINST REGRESSION to the stale claims this iteration removed: the doc must NOT assert the
+  // MVP lacks authenticated identity outright, nor that there is 'no proof of work'.
+  checkTrue("does NOT claim the MVP wholly lacks authenticated identity",
+    !/does not have|do not have|does not implement|no authenticated identity/i.test(T)
+      || /distinct.human|personhood/i.test(T),
+    "the STALE pre-0068 framing; only distinct-HUMAN identity is still out of scope");
+  checkTrue("does NOT claim there is 'no proof of work'",
+    !/no proof of work/i.test(T), "PoW shipped in 0078-0079");
+}
+
+console.log("\nit still admits what remains OUT of scope — the honesty must survive the update");
+{
+  checkTrue("names distinct-human identity as the remaining out-of-scope fix",
+    /distinct.human|personhood|CAPTCHA|attested device/i.test(T),
+    "the ladder+PoW price a ring but do not prove a person — that gap must stay stated");
   checkTrue("restates the no-secrets-in-repo rule",
     /no secrets|no API keys|no .env with real/i.test(T));
 }
