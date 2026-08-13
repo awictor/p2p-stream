@@ -119,16 +119,19 @@ console.log("\nmetrics report: the ONE payload every published number travels in
   // Extract the real POST body expression and evaluate it with known values. If a key is
   // renamed or dropped here, playback is unaffected and nothing throws — the server just
   // records zero, and a published figure quietly becomes wrong.
-  const m = HTML.match(/body: JSON\.stringify\(\{[\s\S]*?\}\),/);
-  if (!m) throw new Error("could not find the report body in web/index.html");
-  const expr = m[0].replace(/^body: /, "").replace(/,$/, "");
+  // The base report is built as `const report = {…}` (P2P-0083 then conditionally adds pubKey/sig/
+  // cert). Extract that object literal — the base counters are the contract metrics.test.js checks.
+  const m = HTML.match(/const report = \{[\s\S]*?\n      \};/);
+  if (!m) throw new Error("could not find the report object in web/index.html");
+  const expr = m[0].replace(/^const report = /, "").replace(/;$/, "");
   const fn = new Function(
     "clientId", "httpBytes", "p2pBytes", "uploadBytes", "ownPeerId", "servedByPeer", "Date",
     `return ${expr};`
   );
-  const body = JSON.parse(fn(
+  // fn returns the report OBJECT directly (the literal is no longer wrapped in JSON.stringify).
+  const body = fn(
     "c1", 111, 222, 333, () => "peer-abc", { "peer-x": 999 }, { now: () => 1700000000000 }
-  ));
+  );
 
   // The server reads exactly these keys — metrics.test.js asserts the other side of this
   // contract, so a rename in either file must fail one of the two suites.
@@ -148,7 +151,7 @@ console.log("\nmetrics report: the ONE payload every published number travels in
 
   // ownPeerId() must be tolerated returning null — the engine has no public getter for it and
   // it is read defensively. A null must serialise, not throw or vanish the whole body.
-  const nullPeer = JSON.parse(fn("c1", 1, 2, 3, () => null, {}, { now: () => 1 }));
+  const nullPeer = fn("c1", 1, 2, 3, () => null, {}, { now: () => 1 });
   check("a null peerId still produces a valid body", nullPeer.peerId, null);
   check("...with the byte counters intact", nullPeer.httpBytes, 1);
 }

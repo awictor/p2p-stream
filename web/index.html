@@ -89,6 +89,55 @@
       }
     })();
 
+    // Tracker CERT (P2P-0083): turn our signed identity into CERTIFIED credit. GET /issue/challenge,
+    // solve the PoW if the tracker set ISSUE_POW_BITS>0 (leading-zero-bits over the SAME len-prefixed
+    // sha256 as server/identity.js powDigest — the boundary is pinned by the challenge length so a
+    // nonce cannot shift it), then POST {pubKey, challenge, nonce} to /issue. window.__cert resolves
+    // to a base64 cert or null. All guarded: no identity / issuer down / unsolvable => null, unsigned
+    // viewer keeps playing. THREAT (HARD RULE 6): a cert prices+binds issuance, it does not prove a
+    // distinct human; collusion among certified keys stays open (see SECURITY.md).
+    let __cert = null;
+    window.__cert = null;
+    window.__certReady = (async () => {
+      try {
+        const id = await window.__identityReady;
+        if (!id) return null;
+        const enc = new TextEncoder();
+        const leadingZeroBits = (bytes) => {
+          let n = 0;
+          for (const byte of bytes) {
+            if (byte === 0) { n += 8; continue; }
+            let b = byte; while (b < 128) { n++; b <<= 1; } break;
+          }
+          return n;
+        };
+        const powDigest = async (challenge, nonce) => new Uint8Array(
+          await crypto.subtle.digest("SHA-256", enc.encode(String(challenge.length) + ":" + challenge + nonce)));
+        const ch = await fetch(`${cfg.issuerUrl}/issue/challenge`).then((r) => r.json());
+        let nonce = "0";
+        if (ch.bits > 0) {
+          // Bounded brute force (matches the server solver's 1<<24 ceiling; the tracker clamps bits so
+          // this terminates). Deterministic counter, not randomness.
+          nonce = null;
+          for (let i = 0; i < (1 << 24); i++) {
+            const cand = i.toString(16);
+            if (leadingZeroBits(await powDigest(ch.challenge, cand)) >= ch.bits) { nonce = cand; break; }
+          }
+          if (nonce === null) return null; // could not meet difficulty
+        }
+        const res = await fetch(`${cfg.issuerUrl}/issue`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pubKey: id.pubKey, challenge: ch.challenge, nonce }),
+        });
+        if (!res.ok) return null;
+        __cert = (await res.json()).cert || null;
+        window.__cert = __cert;
+        return __cert;
+      } catch (e) {
+        return null; // issuer unreachable / any error: stay uncertified, keep playing
+      }
+    })();
+
     // Cumulative counters for THIS viewer. p2p-media-loader reports per-segment.
     let httpBytes = 0, p2pBytes = 0, uploadBytes = 0, peers = 0;
 
@@ -422,19 +471,29 @@
     }
 
     // Report cumulative counters to the dashboard aggregator.
-    setInterval(() => {
+    setInterval(async () => {
+      // `peerId` lets the server map an attested credit onto a tracked viewer — the engine's peer id
+      // and our clientId are otherwise unrelated namespaces. `attest` is our third-party witness of
+      // what OTHER peers served us.
+      const report = {
+        clientId, httpBytes, p2pBytes, uploadBytes, ts: Date.now(),
+        peerId: ownPeerId(), attest: servedByPeer,
+      };
+      // AUTH (P2P-0083): if this viewer has an identity, SIGN the exact object the server verifies —
+      // canonical {clientId, attest} — and attach pubKey (+cert if issued) so the report earns
+      // signed/certified credit. verifyReport ignores the other counters; it re-derives the same two
+      // fields. Unsigned viewers just omit these and keep contributing to offloadRatio.
+      if (__identity) {
+        try {
+          report.pubKey = __identity.pubKey;
+          report.sig = await __identity.sign({ clientId, attest: servedByPeer });
+          if (__cert) report.cert = __cert;
+        } catch { /* signing hiccup: send unsigned rather than skip the report */ }
+      }
       fetch(cfg.metricsUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // Date.now() is fine in the browser; the tracker/metrics server never runs
-        // inside a workflow sandbox, so no restriction here.
-        // `peerId` lets the server map an attested credit onto a tracked viewer — the engine's
-        // peer id and our clientId are otherwise unrelated namespaces. `attest` is our
-        // third-party witness of what OTHER peers served us.
-        body: JSON.stringify({
-          clientId, httpBytes, p2pBytes, uploadBytes, ts: Date.now(),
-          peerId: ownPeerId(), attest: servedByPeer,
-        }),
+        body: JSON.stringify(report),
       }).catch(() => {});
     }, cfg.reportIntervalMs);
   </script>

@@ -38,6 +38,11 @@
     // Metrics collector — viewers POST byte counters here for the dashboard.
     metricsUrl: q.get("metrics") || `${http}://${host}:8001/metrics`,
 
+    // Cert-issuance endpoint (server/tracker.js). The viewer GETs /issue/challenge, solves the PoW
+    // if the tracker set one, and POSTs its pubKey to /issue to obtain a tracker cert — which turns
+    // its signed report into CERTIFIED credit (P2P-0083). Base URL; the viewer appends the paths.
+    issuerUrl: q.get("issuer") || `${http}://${host}:8002`,
+
     // ICE: public STUN only, no TURN (MVP). Symmetric-NAT peers that can't connect
     // simply fall back to HTTP origin — playback never breaks, offload just drops.
     //
