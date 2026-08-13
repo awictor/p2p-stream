@@ -124,8 +124,9 @@ console.log("\nmetrics report: the ONE payload every published number travels in
   const m = HTML.match(/const report = \{[\s\S]*?\n      \};/);
   if (!m) throw new Error("could not find the report object in web/index.html");
   const expr = m[0].replace(/^const report = /, "").replace(/;$/, "");
+  // The literal uses `attest` (the snapshot const built one line above, iter 124); inject that name.
   const fn = new Function(
-    "clientId", "httpBytes", "p2pBytes", "uploadBytes", "ownPeerId", "servedByPeer", "Date",
+    "clientId", "httpBytes", "p2pBytes", "uploadBytes", "ownPeerId", "attest", "Date",
     `return ${expr};`
   );
   // fn returns the report OBJECT directly (the literal is no longer wrapped in JSON.stringify).

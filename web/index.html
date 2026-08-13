@@ -475,9 +475,16 @@
       // `peerId` lets the server map an attested credit onto a tracked viewer — the engine's peer id
       // and our clientId are otherwise unrelated namespaces. `attest` is our third-party witness of
       // what OTHER peers served us.
+      // SNAPSHOT the attest map (iter 124 HARDEN). signing is async (crypto.subtle.sign awaits), and
+      // onSegmentLoaded mutates servedByPeer continuously. If the report sent the LIVE object, a
+      // segment arriving DURING the await would change the body's attest after the signature was
+      // computed — JSON.stringify runs post-await — so the sig would cover a different attest than the
+      // one sent and verifyReport would reject it, silently zeroing signed/certified credit. Freeze a
+      // copy and use it for BOTH the signature and the body so they can never disagree.
+      const attest = { ...servedByPeer };
       const report = {
         clientId, httpBytes, p2pBytes, uploadBytes, ts: Date.now(),
-        peerId: ownPeerId(), attest: servedByPeer,
+        peerId: ownPeerId(), attest,
       };
       // AUTH (P2P-0083): if this viewer has an identity, SIGN the exact object the server verifies —
       // canonical {clientId, attest} — and attach pubKey (+cert if issued) so the report earns
@@ -486,7 +493,7 @@
       if (__identity) {
         try {
           report.pubKey = __identity.pubKey;
-          report.sig = await __identity.sign({ clientId, attest: servedByPeer });
+          report.sig = await __identity.sign({ clientId, attest });
           if (__cert) report.cert = __cert;
         } catch { /* signing hiccup: send unsigned rather than skip the report */ }
       }
