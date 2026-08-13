@@ -77,5 +77,28 @@ console.log("\nit states OWED-not-PAID and the collusion caveat — no false rew
     /SECURITY\.md/i.test(T));
 }
 
+console.log("\nit credits the BROWSER/client as a producer, not just the server as a verifier (P2P-0085)");
+{
+  // Browser-side auth shipped (0082-0084): the viewer mints the credit. The doc must say so, or an
+  // adopter reads the tiers as a server-only scheme and thinks the payable path is unbuilt.
+  checkTrue("says the shipped viewer/browser PRODUCES the credit (keygen/signs/mints in-browser)",
+    /(viewer|browser|client)[\s\S]{0,160}(crypto\.subtle|generates? .*key|signs|mints|produce)/i.test(T),
+    "the browser mints signed/certified/receipted credit — document the producer, not only the verifier");
+  checkTrue("notes safe degradation to UNSIGNED on a non-secure context",
+    /unsigned/i.test(T) && /(secure context|non-secure|http.*LAN|crypto\.subtle)/i.test(T),
+    "a plain-http LAN viewer runs unsigned rather than throwing — the graceful path must be stated");
+}
+
+console.log("\nthe Deferred list scopes the reward deferral to the PAYOUT RAIL, not entitlement (P2P-0085)");
+{
+  // Entitlement (owed) shipped; only the payout rail is deferred. A deferred-list naming the whole
+  // reward tier as unbuilt is stale/incorrect, not merely incomplete.
+  const deferred = (T.match(/##\s*Deferred[\s\S]*?(?=\n##\s|$)/i) || [""])[0];
+  checkTrue("a Deferred section exists", deferred.length > 0);
+  checkTrue("deferral is scoped to the payout RAIL (money/tokens/ad-server), not all of entitlement",
+    /payout rail/i.test(deferred) && /(owed|entitlement)/i.test(deferred),
+    "entitlement computes what is OWED and shipped; only paying it is deferred — the list must not call the whole tier unbuilt");
+}
+
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"}: ${failures} failing assertion(s)`);
 process.exitCode = failures === 0 ? 0 : 1;

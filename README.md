@@ -560,6 +560,16 @@ against signature malleability, exact-length key/sig guards); `server/tracker.js
 (`POST /issue`); `server/metrics.js` verifies every rung and drops self-dealing (a self-attestation
 where `servedBy == attester`, a self-receipt where `senderPeerId == receiverPeerId`).
 
+**The shipped viewer produces this credit in-browser — it is not a server-only scheme.** On load
+`web/index.html` generates an ed25519 keypair via `crypto.subtle`, fetches a tracker certificate
+from `POST /issue` (solving the issuance proof-of-work if `ISSUE_POW_BITS > 0`), signs its `/metrics`
+report over the canonical `{clientId, attest}`, and mints a per-segment **receipt** — signed as the
+receiver — for each segment a peer serves it. So `signed`/`certified`/`receipted` are numbers a real
+browser mints, not just ones the server would accept in theory. It degrades safely: on a non-secure
+context (a plain-`http` LAN URL, where `crypto.subtle` is absent) the viewer runs **unsigned** and
+still contributes to the offload ratio. (Browser⇄server ed25519 interop is byte-for-byte; the
+end-to-end path is exercised by the `browser-*-probe` scripts in `test/`.)
+
 **Ad-free entitlement** is a pure policy function, `earnedEntitlement(receiptedBytes, policy)` in
 `server/entitlement.js`: it turns receiptedBytes — and *only* receiptedBytes — into ad-free
 seconds at an operator-set rate (`AD_FREE_BYTES_PER_SECOND`, default 1 MB/s), floored and
@@ -657,4 +667,7 @@ config. Worth reaching for platform-API instrumentation earlier.
 - Newest live-edge segment is origin-served first, then propagates.
 
 ## Deferred (not this MVP)
-Ad-free-for-relay reward tier, accounts, token incentive, browser broadcasting, TURN, mobile.
+The **payout rail** for the ad-free-for-relay tier (real money/tokens/ad-server integration) —
+entitlement *computes what is owed* (see [the credit ladder](#authenticated-relay-credit--ad-free-entitlement)),
+but paying it needs secrets + payment infra and is out of scope. Also: accounts, token incentive,
+browser broadcasting, TURN, mobile.
