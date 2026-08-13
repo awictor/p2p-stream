@@ -19,7 +19,7 @@
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import path from "path";
-import { issueIdentity, signReport, verifyReport } from "../server/identity.js";
+import { issueIdentity, signReport, verifyReport, verifyReceipt, issueCert } from "../server/identity.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HTML = readFileSync(path.join(__dirname, "..", "web", "index.html"), "utf8");
@@ -59,11 +59,11 @@ if (!m) { console.error("ERROR: could not find the report interval in web/index.
     const fetchStub = (url, opts) => { sentBody = JSON.parse(opts.body); return Promise.resolve({ catch() {} }); };
     const runner = new Function(
       "clientId", "httpBytes", "p2pBytes", "uploadBytes", "ownPeerId", "servedByPeer",
-      "__identity", "__cert", "cfg", "Date", "setInterval", "fetch",
+      "__identity", "__cert", "pendingReceipts", "MAX_PENDING_RECEIPTS", "cfg", "Date", "setInterval", "fetch",
       `${m[0]}`
     );
     runner(
-      "toctou", 1, 2, 0, () => "peer-self", servedByPeer, __identity, null,
+      "toctou", 1, 2, 0, () => "peer-self", servedByPeer, __identity, null, [], 128,
       cfg, { now: () => 1 }, setIntervalStub, fetchStub
     );
     await captured(); // run one report tick
@@ -80,6 +80,52 @@ if (!m) { console.error("ERROR: could not find the report interval in web/index.
     // The sent attest is the SNAPSHOT (pre-mutation), not the live post-mutation map.
     checkTrue("the SENT attest is the pre-mutation snapshot", sentBody.attest["peer-b"] === undefined,
       "a copy was frozen before signing; the later segment is not in this report");
+  }
+
+  console.log("\nper-segment receipts: the viewer signs buffered deliveries + skips self-receipts (P2P-0084)");
+  {
+    const id = issueIdentity();
+    const tracker = issueIdentity();
+    const cert = issueCert(id.publicKey, tracker.privateKey);
+    const __identity = { pubKey: id.publicKey, sign: async (obj) => signReport(obj, id.privateKey) };
+    const pendingReceipts = [
+      { segmentId: "s1", bytes: 262144, senderPeerId: "peer-other" },
+      { segmentId: "s2", bytes: 99999, senderPeerId: "peer-me" }, // sender == receiver -> skip
+    ];
+    let sentBody = null, captured = null;
+    const runner = new Function(
+      "clientId", "httpBytes", "p2pBytes", "uploadBytes", "ownPeerId", "servedByPeer",
+      "__identity", "__cert", "pendingReceipts", "MAX_PENDING_RECEIPTS", "cfg", "Date", "setInterval", "fetch",
+      `${m[0]}`
+    );
+    runner(
+      "rcpt", 1, 2, 0, () => "peer-me", { "peer-other": 262144 }, __identity, cert, pendingReceipts, 128,
+      { metricsUrl: "http://x", reportIntervalMs: 1 }, { now: () => 1 },
+      (fn) => { captured = fn; },
+      (url, opts) => { sentBody = JSON.parse(opts.body); return Promise.resolve({ catch() {} }); }
+    );
+    await captured();
+
+    checkTrue("receipts[] attached when identity+cert present", Array.isArray(sentBody.receipts) && sentBody.receipts.length === 1);
+    const r = sentBody.receipts[0];
+    checkTrue("emitted receipt is the real-peer segment", r && r.segmentId === "s1" && r.senderPeerId === "peer-other");
+    checkTrue("receiverPeerId is our own id", r && r.receiverPeerId === "peer-me");
+    checkTrue("receipt sig verifies under our pubKey",
+      verifyReceipt({ segmentId: r.segmentId, bytes: r.bytes, senderPeerId: r.senderPeerId, receiverPeerId: r.receiverPeerId }, r.sig, id.publicKey));
+    checkTrue("the SELF-receipt (sender==receiver) was NOT emitted",
+      !sentBody.receipts.some((x) => x.senderPeerId === "peer-me"), "self-dealing dropped client-side");
+    checkTrue("pending buffer drained", pendingReceipts.length === 0);
+
+    let body2 = null, cb2 = null;
+    runner(
+      "rcpt2", 1, 2, 0, () => "peer-me", {}, __identity, null,
+      [{ segmentId: "s3", bytes: 1000, senderPeerId: "peer-other" }], 128,
+      { metricsUrl: "http://x", reportIntervalMs: 1 }, { now: () => 1 },
+      (fn) => { cb2 = fn; },
+      (url, opts) => { body2 = JSON.parse(opts.body); return Promise.resolve({ catch() {} }); }
+    );
+    await cb2();
+    checkTrue("no cert -> no receipts attached (server would drop them)", body2.receipts === undefined);
   }
 
   console.log(`\n${failures === 0 ? "PASS" : "FAIL"}: ${failures} failing assertion(s)`);

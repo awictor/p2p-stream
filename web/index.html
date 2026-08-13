@@ -149,6 +149,15 @@
     // peer's upload can be credited by its receivers instead of by its own claim.
     const servedByPeer = Object.create(null);
 
+    // Per-segment PROOF-OF-DELIVERY descriptors (P2P-0084). onSegmentLoaded is synchronous but
+    // signing is async, so we buffer raw {segmentId, bytes, senderPeerId} here and sign them into
+    // receipts at report time. receiptedBytes is the ONLY payout-grade tier, and it needs the
+    // RECEIVER (us) to sign per segment — this is where a real browser produces that credit. Bounded
+    // so a long session cannot grow it without limit; oldest dropped (a dropped receipt just isn't
+    // claimed — never a correctness issue, only unclaimed credit).
+    const pendingReceipts = [];
+    const MAX_PENDING_RECEIPTS = 128;
+
     // Our own engine peer id, so the server can join attested credit to this viewer. Verified
     // reachable at `engine.core.peerId` (probed live — it is not on the engine itself, and
     // there is no public getter, so read it defensively and tolerate null).
@@ -341,6 +350,14 @@
                 // number a reward tier could act on — a peer's claim about itself is
                 // forgeable in one line. See the threat note in server/metrics.js.
                 if (d.peerId) servedByPeer[d.peerId] = (servedByPeer[d.peerId] || 0) + len;
+                // Buffer a proof-of-delivery descriptor for THIS segment (P2P-0084): a receipt the
+                // RECEIVER (us) will sign. Needs a sender peerId, a positive byte count, and a
+                // segment id. Signed + shaped at report time (signing is async; this handler is not).
+                const segmentId = d.segmentUrl || d.segment?.url;
+                if (d.peerId && len > 0 && segmentId) {
+                  pendingReceipts.push({ segmentId, bytes: len, senderPeerId: d.peerId });
+                  if (pendingReceipts.length > MAX_PENDING_RECEIPTS) pendingReceipts.shift();
+                }
               }
               else httpBytes += len; // "http" (origin) or anything non-p2p
               // Per-segment ledger. With P2P on, 4 viewers fetched 1.52x the bytes the
@@ -496,6 +513,26 @@
           report.sig = await __identity.sign({ clientId, attest });
           if (__cert) report.cert = __cert;
         } catch { /* signing hiccup: send unsigned rather than skip the report */ }
+      }
+      // PROOF-OF-DELIVERY receipts (P2P-0084): sign the buffered per-segment descriptors as the
+      // RECEIVER. receiptedBytes counts a receipt only if it verifies under THIS report's (certified)
+      // pubKey, so only send receipts when we have BOTH an identity and a cert — otherwise the server
+      // drops them and the async signing is wasted. Drain the buffer (each descriptor is claimed at
+      // most once). Self-receipt guard: never sign a segment a peer with OUR id served (sender ==
+      // receiver is self-dealing; the server rejects it, but do not even emit it).
+      if (__identity && __cert) {
+        const me = ownPeerId();
+        if (me) {
+          const drained = pendingReceipts.splice(0, pendingReceipts.length);
+          const receipts = [];
+          for (const d of drained) {
+            if (d.senderPeerId === me) continue; // self-receipt: skip
+            const receipt = { segmentId: d.segmentId, bytes: d.bytes, senderPeerId: d.senderPeerId, receiverPeerId: me };
+            try { receipts.push({ ...receipt, sig: await __identity.sign(receipt) }); }
+            catch { /* a signing hiccup drops one receipt, not the report */ }
+          }
+          if (receipts.length) report.receipts = receipts;
+        }
       }
       fetch(cfg.metricsUrl, {
         method: "POST",
