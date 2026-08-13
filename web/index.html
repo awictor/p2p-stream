@@ -52,6 +52,43 @@
       return `v-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
     })();
 
+    // Browser identity (P2P-0082): an ed25519 keypair so this viewer can SIGN its reports and earn
+    // the certified/receipted credit tiers the server verifies (server/identity.js). Interop is
+    // exact — spike P2P-0081 proved crypto.subtle exportKey("spki") base64 == node's spki (44-byte
+    // pubkey) and crypto.subtle.sign({name:"Ed25519"}) == node's 64-byte detached sig, over the SAME
+    // UTF-8 canonical bytes — so `canonicalize` here MUST byte-match server/identity.js canonicalize:
+    // sorted keys at every level, recursive, undefined dropped, scalars via JSON.stringify.
+    const canonicalize = (obj) => {
+      if (obj === null || typeof obj !== "object") return JSON.stringify(obj);
+      if (Array.isArray(obj)) return "[" + obj.map(canonicalize).join(",") + "]";
+      const keys = Object.keys(obj).filter((k) => obj[k] !== undefined).sort();
+      return "{" + keys.map((k) => JSON.stringify(k) + ":" + canonicalize(obj[k])).join(",") + "}";
+    };
+    const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+    // crypto.subtle + Ed25519 need a SECURE CONTEXT (https or localhost). On a plain-http LAN URL it
+    // is absent — GUARD like clientId above so an unsupported browser NEVER throws pre-player; the
+    // viewer just runs unsigned (still counted for offloadRatio, not eligible for a payable tier).
+    // window.__identity resolves to {pubKey, sign(obj)->b64 sig} or null; __identityReady awaits it.
+    let __identity = null;
+    window.__identity = null;
+    window.__identityReady = (async () => {
+      try {
+        if (!(window.isSecureContext && window.crypto && crypto.subtle)) return null;
+        const kp = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+        const spki = await crypto.subtle.exportKey("spki", kp.publicKey);
+        const pubKey = b64(spki);
+        const enc = new TextEncoder();
+        const sign = async (obj) =>
+          b64(await crypto.subtle.sign({ name: "Ed25519" }, kp.privateKey, enc.encode(canonicalize(obj))));
+        __identity = { pubKey, sign };
+        window.__identity = __identity;
+        return __identity;
+      } catch (e) {
+        // Ed25519 unsupported (older engine): stay unsigned rather than killing the player.
+        return null;
+      }
+    })();
+
     // Cumulative counters for THIS viewer. p2p-media-loader reports per-segment.
     let httpBytes = 0, p2pBytes = 0, uploadBytes = 0, peers = 0;
 

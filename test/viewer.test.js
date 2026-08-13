@@ -174,5 +174,30 @@ console.log("\nownPeerId: reads a path with no public getter, so it must never t
   check("empty-string peerId normalises to null", build({ __hls: { p2pEngine: { core: { peerId: "" } } } }), null);
 }
 
+console.log("\nbrowser canonicalize BYTE-MATCHES server/identity.js (P2P-0082) — the signed bytes must agree");
+{
+  // The browser signs canonicalize(report); node verifies canonicalize(report). If the two ever
+  // diverge, EVERY browser signature silently fails to verify and certified credit quietly drops to
+  // 0 — no error, just a dead reward tier. Extract the REAL browser canonicalize and compare its
+  // output to node's on shapes that exercise key-sorting, nesting, arrays, and dropped-undefined.
+  const bm = HTML.match(/const canonicalize = \(obj\) => \{[\s\S]*?\n    \};/);
+  if (!bm) throw new Error("could not find browser canonicalize in web/index.html");
+  const browserCanon = new Function(`${bm[0]} return canonicalize;`)();
+  const { canonicalize: nodeCanon } = await import("../server/identity.js");
+  const samples = [
+    { clientId: "rcv", attest: { "peer-b": 4000000, "peer-a": 1000 } }, // key sort at 2 levels
+    { b: 2, a: 1, c: { z: 9, y: 8 } },                                   // nested sort
+    { arr: [3, 1, { k: "v", a: "b" }], s: "x" },                         // array order preserved, obj sorted
+    { keep: 1, drop: undefined },                                        // undefined dropped
+    { segmentId: "s1", bytes: 262144, senderPeerId: "A", receiverPeerId: "B" }, // a real receipt
+  ];
+  for (let i = 0; i < samples.length; i++) {
+    check(`canonicalize sample #${i} matches node byte-for-byte`, browserCanon(samples[i]), nodeCanon(samples[i]));
+  }
+  // Guard the interop invariant directly: identical output means a browser sig verifies under node.
+  checkTrue("both drop undefined identically (not {\"drop\":undefined})",
+    !browserCanon({ keep: 1, drop: undefined }).includes("drop") && browserCanon({ keep: 1, drop: undefined }) === nodeCanon({ keep: 1, drop: undefined }));
+}
+
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"}: ${failures} failing assertion(s)`);
 process.exitCode = failures === 0 ? 0 : 1;
