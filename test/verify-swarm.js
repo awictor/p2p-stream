@@ -27,6 +27,7 @@ const M_PORT = 8552;
 const INFO_HASH = "swarmloadhash0000000"; // must be exactly 20 chars (bittorrent-tracker wants 20 bytes)
 const HTTP_PER = 1000;   // injected httpBytes per synthetic peer
 const P2P_PER = 3000;    // injected p2pBytes per synthetic peer
+const ANNOUNCE_TIMEOUT_MS = 10000; // a peer that never gets a response by now counts as failed, not hung
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
@@ -45,16 +46,21 @@ function checkTrue(name, actual, why = "") {
 // once the tracker returns a valid announce response (not a failure frame) — so a bad-hash / hung
 // tracker under load is caught, not silently passed as "socket opened".
 function announce(peerId) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const ws = new WebSocket(`ws://localhost:${T_PORT}`);
     let settled = false;
-    ws.on("error", reject);
+    const done = (ok) => { if (settled) return; settled = true; clearTimeout(timer); resolve({ ws, ok }); };
+    // A HANG is exactly the load failure this harness exists to catch — but it must FAIL the run,
+    // not hang it. Under N slow announces a response can lag, so the ceiling is generous; a peer
+    // that produces neither an announce nor a failure frame in time counts as ok=false (not hung).
+    // Never rejects: a rejected promise in Promise.all would abort the whole flood on one bad socket.
+    const timer = setTimeout(() => done(false), ANNOUNCE_TIMEOUT_MS);
+    ws.on("error", () => done(false));
     ws.on("message", (m) => {
-      if (settled) return;
       try {
         const j = JSON.parse(m.toString());
-        if (j["failure reason"]) { settled = true; resolve({ ws, ok: false }); }
-        else if (j.action === "announce") { settled = true; resolve({ ws, ok: true }); }
+        if (j["failure reason"]) done(false);
+        else if (j.action === "announce") done(true);
       } catch { /* ignore non-JSON */ }
     });
     ws.on("open", () => {
