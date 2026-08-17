@@ -85,18 +85,36 @@ const stats = () => fetch(`http://localhost:${M_PORT}/stats`).then((r) => r.json
   const metrics = startMetrics(M_PORT);
   await sleep(300);
 
-  // FLOOD: N tracker announces + N metrics reports, concurrently.
+  const rssStart = process.memoryUsage().rss;
+
+  // FLOOD: N tracker announces + N metrics reports, concurrently. Each /metrics POST is timed
+  // individually (P2P-0087) so we can report a mean per-report latency alongside peak memory.
   const sockets = [];
   let announceOk = 0;
   const announces = [];
   const posts = [];
+  const latencies = [];
   for (let i = 0; i < N; i++) {
     const pid = `swarm-peer-${i.toString(16).padStart(16, "0")}`.slice(0, 20);
     announces.push(announce(pid).then(({ ws, ok }) => { sockets.push(ws); if (ok) announceOk++; }).catch(() => { /* dropped WS caught by the count below */ }));
-    posts.push(post({ clientId: `swarm-${i}`, peerId: pid, httpBytes: HTTP_PER, p2pBytes: P2P_PER, uploadBytes: 0 }).catch(() => {}));
+    const t0 = performance.now();
+    posts.push(post({ clientId: `swarm-${i}`, peerId: pid, httpBytes: HTTP_PER, p2pBytes: P2P_PER, uploadBytes: 0 })
+      .then(() => { latencies.push(performance.now() - t0); }).catch(() => {}));
   }
   await Promise.all([...announces, ...posts]);
   await sleep(500); // let the tracker + aggregator settle
+
+  // MEASUREMENT (P2P-0087). Peak RSS delta over the flood + mean /metrics report latency. This is
+  // SERVER LOAD on loopback with N synthetic peers — it is NOT a browser, offload, or cross-network
+  // number, and must never be quoted as one (HARD RULE 2). Extrapolate the per-peer memory linearly
+  // only with that caveat attached.
+  const rssPeak = process.memoryUsage().rss;
+  const rssDeltaMB = (rssPeak - rssStart) / 1e6;
+  const perPeerKB = latencies.length ? ((rssPeak - rssStart) / latencies.length) / 1e3 : 0;
+  const meanLatencyMs = latencies.length ? latencies.reduce((a, b) => a + b, 0) / latencies.length : NaN;
+  console.log(`\nMEASURE (server-load, loopback, N=${N} synthetic peers — NOT a browser/offload/cross-network number):`);
+  console.log(`  peak RSS delta over flood: ${rssDeltaMB.toFixed(1)} MB  (~${perPeerKB.toFixed(1)} KB/peer, linear extrapolation only)`);
+  console.log(`  mean /metrics report latency: ${meanLatencyMs.toFixed(2)} ms over ${latencies.length} reports`);
 
   console.log(`\nall ${N} announces + reports sent; assert the stack held`);
   check(`all ${N} announces got a valid tracker response (not failure/hang)`, announceOk, N);
@@ -118,6 +136,12 @@ const stats = () => fetch(`http://localhost:${M_PORT}/stats`).then((r) => r.json
   check("httpBytes sum == N * per-peer", s.httpBytes, N * HTTP_PER);
   check("p2pBytes sum == N * per-peer", s.p2pBytes, N * P2P_PER);
   checkTrue("tracked did not exceed the MAX_CLIENTS ceiling", s.tracked <= s.maxClients);
+
+  // The measurement itself must be REAL, not a silent NaN/0 (P2P-0087): a latency was recorded for
+  // every accepted report, and RSS is a finite positive figure.
+  check("a latency sample was recorded for every report", latencies.length, N);
+  checkTrue("mean report latency is a finite number", Number.isFinite(meanLatencyMs));
+  checkTrue("peak RSS is a finite positive figure", Number.isFinite(rssPeak) && rssPeak > 0);
 
   for (const ws of sockets) { try { ws.close(); } catch { /* ignore */ } }
   try { probe.close(); } catch { /* ignore */ }
