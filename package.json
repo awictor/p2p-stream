@@ -23,6 +23,7 @@
     "verify:sweep": "node test/verify-offload.js --sweep 1,2,4,8 --watch 45",
     "verify:control": "node test/verify-offload.js --control --watch 45",
     "verify:remote": "node test/verify-offload.js --remote",
+    "verify:swarm": "node test/verify-swarm.js",
     "test:ledger": "node test/ledger.test.js",
     "test:claim": "node test/claim.test.js",
     "verify:windows": "node test/verify-offload.js --windows default,600,120,30 --watch 40",
