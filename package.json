@@ -24,6 +24,7 @@
     "verify:control": "node test/verify-offload.js --control --watch 45",
     "verify:remote": "node test/verify-offload.js --remote",
     "verify:swarm": "node test/verify-swarm.js",
+    "verify:swarm:flood": "node test/verify-swarm-flood.js",
     "test:ledger": "node test/ledger.test.js",
     "test:claim": "node test/claim.test.js",
     "verify:windows": "node test/verify-offload.js --windows default,600,120,30 --watch 40",
