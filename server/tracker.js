@@ -12,6 +12,7 @@ import http from "http";
 import { Server } from "bittorrent-tracker";
 import { startMetrics } from "./metrics.js";
 import { issueIdentity, issueCert, makeChallenge, verifyPow } from "./identity.js";
+import { installShutdown } from "./shutdown.js";
 
 const PORT = Number(process.env.PORT || 8000);
 const METRICS_PORT = Number(process.env.METRICS_PORT || 8001);
@@ -173,7 +174,9 @@ export function startIssuer(port, identity, powBits = ISSUE_POW_BITS) {
 
 // Build and start the real services. Exported so a test can drive it on throwaway ports and
 // close it, rather than being forced to reimplement the wiring it is meant to be checking.
-export function startTracker(port = PORT, metricsPort = METRICS_PORT) {
+// `graceful` opts into SIGTERM/SIGINT drain (P2P-0092). Off by default so a test booting many
+// trackers in one process registers no competing signal handlers; the script entrypoint opts in.
+export function startTracker(port = PORT, metricsPort = METRICS_PORT, { graceful = false } = {}) {
   const tracker = new Server(TRACKER_CONFIG);
 
   tracker.on("error", (err) => console.error("[tracker] error:", err.message));
@@ -206,11 +209,25 @@ export function startTracker(port = PORT, metricsPort = METRICS_PORT) {
     console.log(`[tracker]   metrics server's TRACKER_PUBKEY to: ${identity.publicKey}`);
     console.log("[tracker]   and pin it across restarts via TRACKER_PRIVKEY/TRACKER_PUBKEY env.");
   }
-  return { tracker, metrics, issuer, identity };
+  // Graceful drain on SIGTERM/SIGINT (P2P-0092). The tracker holds long-lived WS signaling
+  // connections, so an ungraceful kill drops every peer's discovery channel at once on a deploy.
+  // Reuse the SAME installShutdown helper as metrics (P2P-0091): close the tracker (which closes its
+  // WS + HTTP), and in onClose tear down the sibling metrics + issuer HTTP listeners too, so the
+  // process exits 0 with no orphan handle instead of tripping UV_HANDLE_CLOSING 127.
+  let shutdownHandle = null;
+  if (graceful) {
+    shutdownHandle = installShutdown(tracker, {
+      onClose: () => Promise.all([
+        new Promise((r) => { try { metrics.close(r); } catch { r(); } }),
+        new Promise((r) => { try { issuer.close(r); } catch { r(); } }),
+      ]),
+    });
+  }
+  return { tracker, metrics, issuer, identity, shutdown: shutdownHandle };
 }
 
 // Only bind ports when RUN AS A SCRIPT. Without this guard, merely importing this module to reach
 // `lanAddress()` bound :8000 and :8001 and the process never exited (measured: exit 124) — so the
 // module could not be unit-tested at all, and a test would have collided with a running dev stack.
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
-if (isMain) startTracker();
+if (isMain) startTracker(PORT, METRICS_PORT, { graceful: true });
