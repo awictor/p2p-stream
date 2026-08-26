@@ -122,6 +122,23 @@ export function startMetrics(port, { now = () => Date.now(), graceful = false } 
     }
     return n;
   }
+  // numEnv (P2P-0097 config-robustness): a validated numeric reader that allows FRACTIONS (unlike
+  // posIntEnv — refillPerSec=0.5 is legitimate). `allowZero` accepts 0 as a documented opt-out (e.g.
+  // RATE_CAPACITY=0 disables limiting); without it, 0 falls back. Crucially this catches NaN AND
+  // negatives — the two the shipped code missed: `Number(x ?? d)` lets a typo'd NaN through (?? only
+  // guards null/undefined), and `Number(x)||d` silently maps a legit 0 to the default and lets a
+  // NEGATIVE through. A negative/NaN guard limit is worse than the default because it reads as real.
+  function numEnv(name, dflt, { allowZero = false } = {}) {
+    const raw = process.env[name];
+    if (raw === undefined || raw === "") return dflt;
+    const n = Number(raw);
+    const floor = allowZero ? 0 : Number.MIN_VALUE;
+    if (!Number.isFinite(n) || n < floor) {
+      console.warn(`[metrics] ignoring ${name}=${JSON.stringify(raw)} (not a ${allowZero ? "non-negative" : "positive"} number); using ${dflt}`);
+      return dflt;
+    }
+    return n;
+  }
   const MAX_CLIENTS = posIntEnv("MAX_CLIENTS", 5000);
   const MAX_ATTEST_KEYS = posIntEnv("MAX_ATTEST_KEYS", 256);
   const MAX_CLIENTID_LEN = posIntEnv("MAX_CLIENTID_LEN", 128);
@@ -129,8 +146,11 @@ export function startMetrics(port, { now = () => Date.now(), graceful = false } 
   // capacity of 30 with 1/sec refill is generous headroom for honest clients while a flooding IP is
   // capped. RATE_CAPACITY<=0 disables limiting (documented opt-out). Buckets keyed by hostFingerprint
   // hash (never a raw address), pruned so a spray of distinct keys can't grow the store unboundedly.
-  const RATE_CAPACITY = Number(process.env.RATE_CAPACITY ?? 30);
-  const RATE_REFILL_PER_SEC = Number(process.env.RATE_REFILL_PER_SEC ?? 1);
+  // allowZero: RATE_CAPACITY=0 is the documented "disable limiting" switch; RATE_REFILL_PER_SEC=0 is a
+  // valid "burst-only, no refill" config. A NaN/negative for either now falls back + warns (was a bug:
+  // Number(x ?? d) passed NaN straight into the token bucket, which fails-open but silently).
+  const RATE_CAPACITY = numEnv("RATE_CAPACITY", 30, { allowZero: true });
+  const RATE_REFILL_PER_SEC = numEnv("RATE_REFILL_PER_SEC", 1, { allowZero: true });
   const rateBuckets = {};
   let lastRatePrune = 0;
   // Per-report byte ceiling. A cumulative counter for one viewer over one session cannot plausibly
@@ -189,8 +209,8 @@ export function startMetrics(port, { now = () => Date.now(), graceful = false } 
   // MIN_ATTESTERS=2 is the weakest useful setting: it kills a lone forged voucher while still
   // crediting an honest pair. MAX_VOUCH_PER_ATTESTER caps how much ONE receiver can be worth, which
   // is what makes a bigger ring cost more rather than nothing.
-  const MIN_ATTESTERS = Number(process.env.MIN_ATTESTERS || 2);
-  const MAX_VOUCH_PER_ATTESTER = Number(process.env.MAX_VOUCH_PER_ATTESTER || 20e6); // 20MB
+  const MIN_ATTESTERS = posIntEnv("MIN_ATTESTERS", 2);
+  const MAX_VOUCH_PER_ATTESTER = posIntEnv("MAX_VOUCH_PER_ATTESTER", 20e6); // 20MB
 
   // Evicted clients' counters are FOLDED IN HERE rather than discarded. Reports are
   // cumulative snapshots, so deleting an entry would subtract bytes that really were
@@ -203,7 +223,7 @@ export function startMetrics(port, { now = () => Date.now(), graceful = false } 
   // Entitlement is computed ONLY from receiptedBytes (the collusion-resistant tier), so it reports
   // what a viewer is OWED, never what is PAID — the payout rail is out of scope. Env-overridable +
   // documented; a garbage value falls back to the default inside earnedEntitlement.
-  const AD_FREE_BYTES_PER_SECOND = Number(process.env.AD_FREE_BYTES_PER_SECOND) || DEFAULT_BYTES_PER_AD_FREE_SECOND;
+  const AD_FREE_BYTES_PER_SECOND = numEnv("AD_FREE_BYTES_PER_SECOND", DEFAULT_BYTES_PER_AD_FREE_SECOND);
 
   // TIERED ENTITLEMENT POLICY (P2P-0096). A real reward tier tapers, so ENTITLEMENT_POLICY (a JSON
   // policy object: {tiers:[{uptoBytes,bytesPerSecond}], dayCapSeconds}) is resolved once at boot and

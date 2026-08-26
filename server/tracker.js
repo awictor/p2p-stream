@@ -15,8 +15,23 @@ import { issueIdentity, issueCert, makeChallenge, verifyPow } from "./identity.j
 import { installShutdown } from "./shutdown.js";
 import { rateLimit, pruneBuckets } from "./ratelimit.js";
 
-const PORT = Number(process.env.PORT || 8000);
-const METRICS_PORT = Number(process.env.METRICS_PORT || 8001);
+// Validated numeric env reader (P2P-0097 config-robustness). Catches NaN AND negatives — the two a
+// bare `Number(x ?? d)` / `Number(x)||d` misses (?? only guards null/undefined; ||d maps a legit 0 to
+// the default and passes negatives). allowZero accepts 0 as a documented opt-out. Mirrors metrics.js
+// numEnv; kept local so tracker.js has no cross-module coupling for a two-line helper.
+export function numEnv(name, dflt, { allowZero = false, env = process.env } = {}) {
+  const raw = env[name];
+  if (raw === undefined || raw === "") return dflt;
+  const n = Number(raw);
+  const floor = allowZero ? 0 : Number.MIN_VALUE;
+  if (!Number.isFinite(n) || n < floor) {
+    console.warn(`[tracker] ignoring ${name}=${JSON.stringify(raw)} (not a ${allowZero ? "non-negative" : "positive"} number); using ${dflt}`);
+    return dflt;
+  }
+  return n;
+}
+const PORT = numEnv("PORT", 8000);
+const METRICS_PORT = numEnv("METRICS_PORT", 8001);
 // Per-IP WS connection rate limit (P2P-0094), reusing the same token-bucket as /metrics (P2P-0093).
 // The WS signaling server is PUBLIC + UNAUTHENTICATED: one IP opening connections in a loop can churn
 // swarm peer lists / exhaust sockets. A per-IP bucket caps new-connection rate; over-cap sockets are
@@ -28,11 +43,13 @@ const METRICS_PORT = Number(process.env.METRICS_PORT || 8001);
 // module — the module is import-cached, so a load-time const would freeze the default for the suite.
 function wsRateConfig(env = process.env) {
   return {
-    capacity: Number(env.WS_RATE_CAPACITY ?? 20),
-    refillPerSec: Number(env.WS_RATE_REFILL_PER_SEC ?? 5),
+    // allowZero: WS_RATE_CAPACITY=0 disables the WS connection limiter (documented opt-out);
+    // WS_RATE_REFILL_PER_SEC=0 is valid burst-only. NaN/negative now falls back + warns.
+    capacity: numEnv("WS_RATE_CAPACITY", 20, { allowZero: true, env }),
+    refillPerSec: numEnv("WS_RATE_REFILL_PER_SEC", 5, { allowZero: true, env }),
   };
 }
-const ISSUER_PORT = Number(process.env.ISSUER_PORT || 8002);
+const ISSUER_PORT = numEnv("ISSUER_PORT", 8002);
 // Cert-issuance proof-of-work difficulty (leading zero bits). 0 = OFF (default, back-compat): the
 // issuer hands a cert to any pubKey. >0 forces the client to solve a PoW per issuance, pricing a
 // sybil ring in CPU (P2P-0079). Positive-int validated so a garbage env falls back to 0, never NaN.
@@ -102,7 +119,7 @@ export function lanAddress() {
 //   THREAT NOTE: this bounds FRAME SIZE. It does NOT authenticate the signaling peer, and does not
 //   stop a flood of small valid frames — that needs authenticated identity at the tracker, out of
 //   scope (roadmap.md). It closes the single-giant-frame vector, not identity.
-const WS_MAX_PAYLOAD = Number(process.env.WS_MAX_PAYLOAD || 64 * 1024); // 64KB
+const WS_MAX_PAYLOAD = numEnv("WS_MAX_PAYLOAD", 64 * 1024); // 64KB
 export const TRACKER_CONFIG = {
   udp: false,
   http: false,
