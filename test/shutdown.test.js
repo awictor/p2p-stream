@@ -119,6 +119,41 @@ else {
       dispose();
     }
 
+    console.log("\nforce-timeout — a server.close that NEVER calls back still exits 0 within the bound");
+    {
+      // The whole point of timeoutMs: a stuck or hostile connection must not block the exit forever.
+      // This fake never invokes its close callback, so ONLY the force-timeout can complete the drain.
+      let exitCalls = 0; let exitCode = null;
+      const stuckServer = { close() { /* never calls cb — simulates a hung/hostile connection */ } };
+      const t0 = process.hrtime.bigint();
+      const { shutdown, dispose } = installShutdown(stuckServer, {
+        timeoutMs: 150,
+        exit: (c) => { exitCalls++; exitCode = c; },
+        log: () => {},
+      });
+      await shutdown("SIGTERM");
+      const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
+      checkTrue("force-path still exits (close cb never fired)", exitCalls === 1, `exitCalls=${exitCalls}`);
+      checkTrue("force-path exit code 0", exitCode === 0, `got ${exitCode}`);
+      checkTrue("force-path fired at ~timeoutMs, not instantly nor never", elapsedMs >= 120 && elapsedMs < 2000,
+        `elapsedMs=${elapsedMs.toFixed(0)}`);
+      dispose();
+    }
+
+    console.log("\ndispose() removes the signal handlers it registered (no listener leak)");
+    {
+      const fakeServer = { close(cb) { cb(); } };
+      const before = process.listenerCount("SIGTERM");
+      const { dispose } = installShutdown(fakeServer, {
+        signals: ["SIGTERM"], exit: () => {}, log: () => {},
+      });
+      const during = process.listenerCount("SIGTERM");
+      dispose();
+      const after = process.listenerCount("SIGTERM");
+      checkTrue("registers exactly one SIGTERM handler", during === before + 1, `before=${before} during=${during}`);
+      checkTrue("dispose() removes it (back to baseline)", after === before, `before=${before} after=${after}`);
+    }
+
     clearTimeout(watchdog);
     console.log(`\n${failures === 0 ? "PASS" : "FAIL"}: ${failures} failing assertion(s)`);
     // exit() (not just exitCode): the child's IPC channel + any lingering handle could otherwise keep
