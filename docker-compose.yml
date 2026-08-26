@@ -66,6 +66,7 @@ services:
     ports:
       - "8000:8000"      # ws:// signaling — the viewer derives ${host}:8000
       - "8001:8001"      # metrics POST target + dashboard
+      - "8002:8002"      # identity issuer (POST /issue, GET /pubkey) — viewer derives ${host}:8002
     # MIN_ATTESTERS / MAX_VOUCH_PER_ATTESTER are read from env by server/metrics.js and are
     # deliberately NOT set here: the defaults (2, 20MB) are the values every published number
     # was measured with. Override them at the command line if you are exploring, not in a file.

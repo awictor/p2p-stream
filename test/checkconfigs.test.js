@@ -149,7 +149,7 @@ console.log("\nevery config has a REACHABLE failure — broken input must exit 1
     // 3. An undeclared named volume must fail — compose would treat it as a relative host path,
     //    so ffmpeg and nginx would silently stop sharing the segment directory.
     writeFileSync(path.join(tmp, "docker-compose.yml"),
-      compose.replace(/^volumes:\n(  \w[^\n]*\n)+/m, "volumes:\n  origin-logs:\n  origin-temp:\n"));
+      compose.replace(/^volumes:\r?\n(  \w[^\n]*\r?\n)+/m, "volumes:\n  origin-logs:\n  origin-temp:\n"));
     r = run(tmp);
     check("an undeclared volume exits 1", r.code, 1);
     checkTrue("...naming the volume", /hls/.test(r.out));

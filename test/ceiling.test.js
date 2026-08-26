@@ -19,6 +19,10 @@
 process.env.MAX_CLIENTS = "10";
 process.env.MAX_ATTEST_KEYS = "4";
 process.env.MAX_CLIENTID_LEN = "16";
+// This test floods 100+ POSTs from one host to exercise the COUNT ceiling + byte accounting, which
+// trips the per-IP rate limiter (default RATE_CAPACITY=30) and turns real assertions into 429s.
+// Rate limiting has its own test (ratelimit.test.js); disable it here (documented 0 = off).
+process.env.RATE_CAPACITY = "0";
 
 import { startMetrics } from "../server/metrics.js";
 

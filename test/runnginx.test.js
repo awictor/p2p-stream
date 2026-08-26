@@ -136,9 +136,14 @@ console.log("\nthe shipped command ACTUALLY works (run it, do not just read it)"
   if (probe.code !== 0 && /ENOENT/.test(String(probe.out))) {
     console.log("  SKIP  live nginx checks — no nginx binary (bin/ absent and none on PATH)");
   } else {
-    // The exact pair run-nginx.sh execs.
+    // The exact pair run-nginx.sh execs. `nginx -t` also runs a BIND test: on a box where :8080 is
+    // privileged/forbidden (Windows socket perms, unprivileged CI) it exits non-zero with
+    // "[emerg] bind() ... failed" AFTER printing "syntax is ok". That is an environment limit, not a
+    // broken config, so accept syntax-ok-with-bind-failure as a pass (matches scripts/check-configs.mjs).
     const ok = run(["-t", "-p", origin, "-c", path.join(origin, "nginx.conf")]);
-    check("the shipped -p/-c pair passes nginx -t", ok.code, 0);
+    const syntaxOk = ok.code === 0 || (/syntax is ok/.test(ok.out) && /bind\(\) to .* failed/.test(ok.out));
+    checkTrue("the shipped -p/-c pair passes nginx -t", syntaxOk,
+      "nginx -t reported a real syntax/directive error (not just a bind-test failure)");
 
     // A WRONG prefix with the same absolute conf: parses, then cannot open its own log. This is
     // why -p is asserted separately from -c rather than treated as one setting.

@@ -88,7 +88,7 @@ console.log("the ports are a CONTRACT with the viewer, derived from web/p2p-conf
 {
   // Sanity on the derivation itself: if this regex ever stops finding the ports, every assertion
   // below would trivially pass against an empty list.
-  check("found the viewer's derived ports in p2p-config.js", derivedPorts.join(","), "8000,8001,8080");
+  check("found the viewer's derived ports in p2p-config.js", derivedPorts.join(","), "8000,8001,8002,8080");
   checkTrue("compose.yml exists", existsSync(COMPOSE_PATH));
   for (const p of derivedPorts) {
     checkTrue(`port ${p} (derived by the viewer) is published`, hostPorts.includes(p),
