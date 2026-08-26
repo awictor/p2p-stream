@@ -13,9 +13,25 @@ import { Server } from "bittorrent-tracker";
 import { startMetrics } from "./metrics.js";
 import { issueIdentity, issueCert, makeChallenge, verifyPow } from "./identity.js";
 import { installShutdown } from "./shutdown.js";
+import { rateLimit, pruneBuckets } from "./ratelimit.js";
 
 const PORT = Number(process.env.PORT || 8000);
 const METRICS_PORT = Number(process.env.METRICS_PORT || 8001);
+// Per-IP WS connection rate limit (P2P-0094), reusing the same token-bucket as /metrics (P2P-0093).
+// The WS signaling server is PUBLIC + UNAUTHENTICATED: one IP opening connections in a loop can churn
+// swarm peer lists / exhaust sockets. A per-IP bucket caps new-connection rate; over-cap sockets are
+// closed immediately (1013 "try again later"). WS_RATE_CAPACITY<=0 disables (documented opt-out).
+//   THREAT (HARD RULE 6): prices new-connection WALL-CLOCK per source IP. Does NOT authenticate the
+//   peer and does NOT stop a many-IP distributed flood (needs identity, out of scope). Complements
+//   WS_MAX_PAYLOAD (frame size) — this bounds connection RATE, that bounds frame SIZE.
+// Read at startTracker() CALL time (not module load) so a test can set the env after importing this
+// module — the module is import-cached, so a load-time const would freeze the default for the suite.
+function wsRateConfig(env = process.env) {
+  return {
+    capacity: Number(env.WS_RATE_CAPACITY ?? 20),
+    refillPerSec: Number(env.WS_RATE_REFILL_PER_SEC ?? 5),
+  };
+}
 const ISSUER_PORT = Number(process.env.ISSUER_PORT || 8002);
 // Cert-issuance proof-of-work difficulty (leading zero bits). 0 = OFF (default, back-compat): the
 // issuer hands a cert to any pubKey. >0 forces the client to solve a PoW per issuance, pricing a
@@ -192,6 +208,29 @@ export function startTracker(port = PORT, metricsPort = METRICS_PORT, { graceful
     console.log(`[tracker] WS signaling on ws://localhost:${port}`);
     if (lan !== "localhost") console.log(`[tracker] reachable from LAN at ws://${lan}:${port}`);
   });
+
+  // PER-IP WS CONNECTION RATE LIMIT (P2P-0094). tracker.ws exists once listen() has wired the WS
+  // transport. Hook 'connection' and reuse the token-bucket: over-cap sockets from one IP are closed
+  // with 1013 ("try again later") before any announce is processed. Buckets keyed by remote address,
+  // pruned so a spray of source IPs can't grow the store unboundedly. Exposed as tracker.wsRateBuckets
+  // for tests. Skips wiring when disabled (capacity<=0) so honest single-box dev/test is untouched.
+  const wsRateBuckets = {};
+  tracker.wsRateBuckets = wsRateBuckets;
+  const { capacity: wsCap, refillPerSec: wsRefill } = wsRateConfig();
+  if (wsCap > 0 && tracker.ws) {
+    let lastPrune = 0;
+    tracker.ws.on("connection", (socket, req) => {
+      const now = Date.now();
+      const addr = (req && (req.socket?.remoteAddress || req.connection?.remoteAddress)) || "unknown";
+      if (now - lastPrune > 60000) { pruneBuckets(wsRateBuckets, now, 600000); lastPrune = now; }
+      const rl = rateLimit(wsRateBuckets, addr, now, { capacity: wsCap, refillPerSec: wsRefill });
+      if (!rl.allowed) {
+        // 1013 = "try again later". Close immediately; bittorrent-tracker's own 'connection' handler
+        // still runs (listener order), but a closing socket announces nothing useful.
+        try { socket.close(1013, "rate limit"); } catch { /* ignore */ }
+      }
+    });
+  }
 
   // Metrics collector runs alongside (viewers POST their byte counters here).
   const metrics = startMetrics(metricsPort);
