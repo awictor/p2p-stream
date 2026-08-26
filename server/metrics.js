@@ -8,7 +8,7 @@ import { networkInterfaces } from "os";
 import { fileURLToPath } from "url";
 import { createHash, randomBytes } from "crypto";
 import { verifyReport, verifyCert, verifyReceipt } from "./identity.js";
-import { earnedEntitlement, DEFAULT_BYTES_PER_AD_FREE_SECOND } from "./entitlement.js";
+import { earnedEntitlement, applyPolicy, DEFAULT_BYTES_PER_AD_FREE_SECOND } from "./entitlement.js";
 import { installShutdown } from "./shutdown.js";
 import { rateLimit, pruneBuckets } from "./ratelimit.js";
 
@@ -204,6 +204,25 @@ export function startMetrics(port, { now = () => Date.now(), graceful = false } 
   // what a viewer is OWED, never what is PAID — the payout rail is out of scope. Env-overridable +
   // documented; a garbage value falls back to the default inside earnedEntitlement.
   const AD_FREE_BYTES_PER_SECOND = Number(process.env.AD_FREE_BYTES_PER_SECOND) || DEFAULT_BYTES_PER_AD_FREE_SECOND;
+
+  // TIERED ENTITLEMENT POLICY (P2P-0096). A real reward tier tapers, so ENTITLEMENT_POLICY (a JSON
+  // policy object: {tiers:[{uptoBytes,bytesPerSecond}], dayCapSeconds}) is resolved once at boot and
+  // applied to each client's receiptedBytes via the pure applyPolicy (P2P-0095). When unset OR
+  // malformed, we fall back to the flat rate above — the flat single-tier policy — so behaviour is
+  // unchanged for an operator who never sets it. Still OWED, never PAID.
+  const ENTITLEMENT_POLICY = (() => {
+    const raw = process.env.ENTITLEMENT_POLICY;
+    if (raw) {
+      try {
+        const p = JSON.parse(raw);
+        if (p && typeof p === "object") return p;
+      } catch {
+        console.warn(`[metrics] ignoring ENTITLEMENT_POLICY (not valid JSON); using flat rate ${AD_FREE_BYTES_PER_SECOND}`);
+      }
+    }
+    // Flat fallback expressed AS a one-tier policy so /stats always publishes a uniform policy shape.
+    return { tiers: [{ bytesPerSecond: AD_FREE_BYTES_PER_SECOND }] };
+  })();
 
   // RECEIVER-ATTESTED UPLOAD. `uploadBytes` above is what a viewer claims about ITSELF, which a
   // modified client forges in one line — so the ad-free-for-relay tier cannot pay out on it.
@@ -466,7 +485,9 @@ export function startMetrics(port, { now = () => Date.now(), graceful = false } 
     const entitlementByClient = {};
     let entitlementSeconds = 0;
     for (const [id, sum] of Object.entries(receiptedByClient)) {
-      const secs = earnedEntitlement({ receiptedBytes: sum, bytesPerSecond: AD_FREE_BYTES_PER_SECOND });
+      // applyPolicy (P2P-0095/0096) over the resolved tiered policy; the flat rate is the single-tier
+      // fallback baked into ENTITLEMENT_POLICY, so this stays back-compatible when the env is unset.
+      const secs = applyPolicy(sum, ENTITLEMENT_POLICY);
       if (secs > 0) { entitlementByClient[id] = secs; entitlementSeconds += secs; }
     }
     // Who vouched for whom, and how much each one vouched. Needed for the K-of-N filter below:
@@ -549,6 +570,9 @@ export function startMetrics(port, { now = () => Date.now(), graceful = false } 
       entitlementByClient,
       entitlementSeconds,
       adFreeBytesPerSecond: AD_FREE_BYTES_PER_SECOND,
+      // The resolved tiered policy (P2P-0096) whose applyPolicy produced entitlementSeconds. Echoed so
+      // the figure is never read without its basis; flat-rate operators see a one-tier policy here.
+      entitlementPolicy: ENTITLEMENT_POLICY,
       trackerCertRequired: !!TRACKER_PUBKEY,
       // K-of-N FILTERED credit, reported ALONGSIDE the raw figure rather than replacing it. The gap
       // between them is the point: a large drop means credit was resting on too few witnesses or on
