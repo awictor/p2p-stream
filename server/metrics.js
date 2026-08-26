@@ -30,6 +30,14 @@ export function hostFingerprint(ip, salt = HOST_SALT) {
   return { host: createHash("sha256").update(salt).update(addr).digest("hex").slice(0, 12), loopback };
 }
 
+// Structured request-log line (P2P-0090). Pure: exactly {method,path,status,ms,requestId} as a
+// single JSON string, no trailing newline (the caller adds it). Exported so a test pins the shape
+// without booting a server. Kept to these five fields on purpose — a log line is a contract; extra
+// fields drift and downstream parsers break.
+export function buildLogLine({ method, path, status, ms, requestId }) {
+  return JSON.stringify({ method, path, status, ms, requestId });
+}
+
 // `now` is injectable purely so tests can drive the stale/evict windows deterministically
 // instead of sleeping for real seconds. Production always uses Date.now.
 export function startMetrics(port, { now = () => Date.now() } = {}) {
@@ -44,6 +52,24 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
     res.set("Access-Control-Allow-Origin", "*");
     res.set("Access-Control-Allow-Headers", "Content-Type");
     if (req.method === "OPTIONS") return res.sendStatus(204);
+    next();
+  });
+  // STRUCTURED REQUEST LOG (P2P-0090). One line of JSON per request so an ops team can correlate by
+  // request-id and read status/latency from a log pipeline, not prose. OFF by default (LOG_LEVEL
+  // unset/"off") so tests + CI stay silent; LOG_LEVEL="info" emits. Captured at entry (t0 + id), the
+  // line is emitted on res "finish" — the point where statusCode and full duration are final. The
+  // formatter is pure + exported so its shape is unit-testable without booting a server.
+  const LOG_ON = /^(info|debug|trace)$/i.test(process.env.LOG_LEVEL || "");
+  app.use((req, res, next) => {
+    if (!LOG_ON) return next();
+    const t0 = performance.now();
+    const requestId = randomBytes(8).toString("hex");
+    res.on("finish", () => {
+      process.stdout.write(buildLogLine({
+        method: req.method, path: req.path, status: res.statusCode,
+        ms: +(performance.now() - t0).toFixed(2), requestId,
+      }) + "\n");
+    });
     next();
   });
   // QUIET body-parser errors. A malformed JSON body or an over-limit payload otherwise dumps a full
