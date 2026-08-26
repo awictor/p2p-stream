@@ -9,6 +9,7 @@ import { fileURLToPath } from "url";
 import { createHash, randomBytes } from "crypto";
 import { verifyReport, verifyCert, verifyReceipt } from "./identity.js";
 import { earnedEntitlement, DEFAULT_BYTES_PER_AD_FREE_SECOND } from "./entitlement.js";
+import { installShutdown } from "./shutdown.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -40,7 +41,9 @@ export function buildLogLine({ method, path, status, ms, requestId }) {
 
 // `now` is injectable purely so tests can drive the stale/evict windows deterministically
 // instead of sleeping for real seconds. Production always uses Date.now.
-export function startMetrics(port, { now = () => Date.now() } = {}) {
+// `graceful` wires SIGTERM/SIGINT drain (P2P-0091). Off by default so a test that boots many servers
+// in one process does not register competing signal handlers; the CLI entrypoint opts in.
+export function startMetrics(port, { now = () => Date.now(), graceful = false } = {}) {
   const app = express();
   // Bound the request body. /metrics is PUBLIC and UNAUTHENTICATED; a real report (even with the
   // MAX_ATTEST_KEYS-capped attest map) is a few KB, so express.json's 100KB default is ~100x too
@@ -558,7 +561,7 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   // server can never exit — the listener holds the event loop open, so `node test/x.js` hangs
   // until an external timeout kills it. That is survivable for a standalone probe but would stall
   // `npm test` forever, so any test in the suite must be able to `.close()` what it started.
-  return app.listen(port, () => {
+  const server = app.listen(port, () => {
     listening = true; // /readyz flips to 200 only now (P2P-0089)
     console.log(`[metrics] dashboard http://localhost:${port}`);
     // Also print the LAN address: a viewer on another machine must POST here, and
@@ -567,4 +570,8 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
     const lan = nets.find((n) => n && n.family === "IPv4" && !n.internal);
     if (lan) console.log(`[metrics] reachable from LAN at http://${lan.address}:${port}`);
   });
+  // Opt-in: the CLI entrypoint drains on SIGTERM/SIGINT and exits 0 (P2P-0091). Handlers are only
+  // registered when asked so a test booting many servers in one process stays handler-free.
+  if (graceful) installShutdown(server);
+  return server;
 }
