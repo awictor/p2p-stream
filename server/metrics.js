@@ -10,6 +10,7 @@ import { createHash, randomBytes } from "crypto";
 import { verifyReport, verifyCert, verifyReceipt } from "./identity.js";
 import { earnedEntitlement, DEFAULT_BYTES_PER_AD_FREE_SECOND } from "./entitlement.js";
 import { installShutdown } from "./shutdown.js";
+import { rateLimit, pruneBuckets } from "./ratelimit.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -124,6 +125,14 @@ export function startMetrics(port, { now = () => Date.now(), graceful = false } 
   const MAX_CLIENTS = posIntEnv("MAX_CLIENTS", 5000);
   const MAX_ATTEST_KEYS = posIntEnv("MAX_ATTEST_KEYS", 256);
   const MAX_CLIENTID_LEN = posIntEnv("MAX_CLIENTID_LEN", 128);
+  // Per-IP rate limit on the PUBLIC /metrics POST (P2P-0093). A viewer posts every few seconds, so a
+  // capacity of 30 with 1/sec refill is generous headroom for honest clients while a flooding IP is
+  // capped. RATE_CAPACITY<=0 disables limiting (documented opt-out). Buckets keyed by hostFingerprint
+  // hash (never a raw address), pruned so a spray of distinct keys can't grow the store unboundedly.
+  const RATE_CAPACITY = Number(process.env.RATE_CAPACITY ?? 30);
+  const RATE_REFILL_PER_SEC = Number(process.env.RATE_REFILL_PER_SEC ?? 1);
+  const rateBuckets = {};
+  let lastRatePrune = 0;
   // Per-report byte ceiling. A cumulative counter for one viewer over one session cannot plausibly
   // exceed this; default 1TB is orders of magnitude above any real live session yet finite. It
   // exists because `Number(x) || 0` (the old coercion) let NEGATIVES and absurd magnitudes through
@@ -229,6 +238,15 @@ export function startMetrics(port, { now = () => Date.now(), graceful = false } 
   const receiptsByClient = new Map();
 
   app.post("/metrics", (req, res) => {
+    // PER-IP RATE LIMIT (P2P-0093), checked FIRST so a flood is rejected before any body work,
+    // verify, or Map mutation. Keyed by the hashed host fingerprint, never a raw address. A denied
+    // request answers 429 and touches nothing. THREAT: bounds one IP's wall-clock rate; does NOT
+    // authenticate the peer nor stop a many-IP distributed flood (roadmap).
+    const rlNow = now();
+    const rlKey = hostFingerprint(req.socket?.remoteAddress || req.ip || "")?.host || "unknown";
+    if (rlNow - lastRatePrune > 60000) { pruneBuckets(rateBuckets, rlNow, 600000); lastRatePrune = rlNow; }
+    const rl = rateLimit(rateBuckets, rlKey, rlNow, { capacity: RATE_CAPACITY, refillPerSec: RATE_REFILL_PER_SEC });
+    if (!rl.allowed) return res.status(429).json({ error: "rate limit exceeded" });
     const { clientId: rawClientId, httpBytes = 0, p2pBytes = 0, uploadBytes = 0, ts, peerId, attest, pubKey, sig, cert, receipts } = req.body || {};
     if (!rawClientId || typeof rawClientId !== "string") return res.status(400).json({ error: "clientId required" });
     // Clamp the clientId LENGTH before it is used as a Map key. An unbounded string is both a
