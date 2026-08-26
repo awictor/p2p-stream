@@ -82,5 +82,39 @@ console.log("\nempty/malformed policy falls back to flat default (not 0 for real
     applyPolicy(5_000_000, {}) === earnedEntitlement({ receiptedBytes: 5_000_000 }));
 }
 
+// ---- HARDEN (P2P-0174): pin the malformed-tier edge contract so a refactor can't silently drift it.
+console.log("\njunk-rate tier: its band earns 0, and bytes in that band are NOT re-credited elsewhere");
+{
+  // tier1 0-10MB @1MB/s (=10s), tier2 10-20MB with a JUNK rate (0 seconds for that band), tier3 open @1MB/s.
+  // 15MB: 10s (tier1) + 0 (tier2 junk band, the 5MB in 10-15 earns nothing) + 0 (nothing above 20MB) = 10s.
+  // The 5MB in the junk band must be CONSUMED (lower advances), not spilled into tier3 — else it double-earns.
+  const p = { tiers: [
+    { uptoBytes: 10_000_000, bytesPerSecond: 1_000_000 },
+    { uptoBytes: 20_000_000, bytesPerSecond: 0 },      // junk rate -> band earns 0
+    { bytesPerSecond: 1_000_000 },                      // open
+  ] };
+  check("junk-rate band earns 0 and does not leak to a later tier", applyPolicy(15_000_000, p), 10);
+  // 25MB: 10s (tier1) + 0 (tier2) + 5MB above 20MB @1MB/s = 5s => 15s.
+  check("bytes above the junk band earn in the open tier", applyPolicy(25_000_000, p), 15);
+}
+
+console.log("\nnon-ascending uptoBytes: a tier whose ceiling <= lower collapses to the open path (documented)");
+{
+  // tier2's uptoBytes (5MB) is BELOW tier1's (10MB). Per the code, ceil = upto>lower ? upto : Infinity,
+  // so tier2 becomes an OPEN tier catching the remainder at its rate. Pin THIS behaviour (not a crash/NaN).
+  const p = { tiers: [
+    { uptoBytes: 10_000_000, bytesPerSecond: 1_000_000 },
+    { uptoBytes: 5_000_000, bytesPerSecond: 2_000_000 }, // mis-ordered -> treated as open
+  ] };
+  // 14MB: 10s (tier1 0-10MB) + 4MB @2MB/s = 2s => 12s. No NaN, no crash, deterministic.
+  check("mis-ordered tier resolves deterministically (no NaN)", applyPolicy(14_000_000, p), 12);
+  checkTrue("result is a finite integer", Number.isInteger(applyPolicy(14_000_000, p)));
+}
+
+console.log("\ntiers not an array -> flat fallback (not a throw)");
+{
+  checkTrue("tiers:'oops' falls back to flat default", applyPolicy(5_000_000, { tiers: "oops" }) === earnedEntitlement({ receiptedBytes: 5_000_000 }));
+}
+
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"}: ${failures} failing assertion(s)`);
 process.exitCode = failures === 0 ? 0 : 1;
