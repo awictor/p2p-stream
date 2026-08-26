@@ -318,6 +318,16 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   });
 
   app.get("/stats", (req, res) => res.json(aggregate()));
+
+  // OBSERVABILITY (P2P-0089). Ops probes for a real deploy. /healthz is pure liveness — the process
+  // is up and the event loop answers — so it is ALWAYS 200 (a booted app can serve it). /readyz is
+  // readiness — 200 only once the HTTP listener is actually accepting (the `listening` flag flips in
+  // the listen callback below), 503 before. A load balancer routes on /readyz, restarts on /healthz.
+  let listening = false;
+  app.get("/healthz", (req, res) => res.status(200).json({ ok: true }));
+  app.get("/readyz", (req, res) =>
+    listening ? res.status(200).json({ ready: true }) : res.status(503).json({ ready: false }));
+
   app.get("/", (req, res) => res.sendFile(path.join(__dirname, "dashboard.html")));
 
   function aggregate() {
@@ -523,6 +533,7 @@ export function startMetrics(port, { now = () => Date.now() } = {}) {
   // until an external timeout kills it. That is survivable for a standalone probe but would stall
   // `npm test` forever, so any test in the suite must be able to `.close()` what it started.
   return app.listen(port, () => {
+    listening = true; // /readyz flips to 200 only now (P2P-0089)
     console.log(`[metrics] dashboard http://localhost:${port}`);
     // Also print the LAN address: a viewer on another machine must POST here, and
     // "localhost" would resolve to that machine itself.
