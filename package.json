@@ -74,7 +74,8 @@
     "test:shutdown": "node test/shutdown.test.js",
     "test:trackershutdown": "node test/trackershutdown.test.js",
     "test:ratelimit": "node test/ratelimit.test.js",
-    "test:trackerratelimit": "node test/trackerratelimit.test.js"
+    "test:trackerratelimit": "node test/trackerratelimit.test.js",
+    "test:ci": "node scripts/test-ci.mjs"
   },
   "dependencies": {
     "bittorrent-tracker": "^11.2.1",

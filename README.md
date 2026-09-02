@@ -1,5 +1,7 @@
 # P2P Live Streaming MVP — prove bandwidth offload
 
+[![CI](https://github.com/awictor/p2p-stream/actions/workflows/ci.yml/badge.svg)](https://github.com/awictor/p2p-stream/actions/workflows/ci.yml)
+
 
 Viewers relay live video segments to each other over WebRTC so the origin serves few
 and peers fan out the rest, cutting the egress bill that dominates streaming costs.
