@@ -12,5 +12,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      - name: Install nginx (config-lint tests use `nginx -t`)
+        run: sudo apt-get update && sudo apt-get install -y nginx
       - run: npm ci
       - run: npm test
